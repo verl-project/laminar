@@ -1,0 +1,281 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laminar"
+version = "0.1.0"
+description = "Laminar async RL: versioned rollout, relay, and ExperienceBuffer on top of verl"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "hydra-core",
+    "omegaconf",
+    "orjson",
+    "psutil",
+    "verl>=0.10.0.dev0,<0.11",
+    "tensordict>=0.10.0",
+    "uni-agent==0.1.0.dev0",
+]
+
+[project.optional-dependencies]
+swe = ["swebench==4.1.0"]
+ucx = ["ucxx-cu13==0.51.1"]
+vllm = [
+    "verl[vllm]",
+    # synced from pinned verl (begin)
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "torchaudio==2.11.0",
+    "vllm==0.32.0",
+    "transformers==5.16.1",
+    "TransferQueue>=0.1.11",
+    "pyzmq",
+    "msgspec",
+    "accelerate",
+    "codetiming",
+    "datasets",
+    "dill",
+    "hydra-core",
+    "numpy>=2.0.0",
+    "pandas",
+    "peft",
+    "pyarrow>=19.0.0",
+    "pybind11",
+    "pylatexenc",
+    "transformers",
+    "ray[default]>=2.41.0",
+    "torchdata",
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "wandb",
+    "packaging>=20.0",
+    "tensorboard",
+    "fastapi",
+    "uvicorn",
+    "mathruler",
+    "qwen_vl_utils",
+    "torchcodec",
+    "cachetools",
+    "einops",
+    "nvtx",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-rerunfailures",
+    # synced from pinned verl (end)
+]
+fsdp = [
+    "verl[fsdp]",
+    # synced from pinned verl (begin)
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "torchaudio==2.11.0",
+    "liger-kernel==0.8.4",
+    "trl==0.27.0",
+    "flash-linear-attention==0.5.2",
+    "cupy-cuda13x==14.0.1",
+    "flash-attn==2.8.3",
+    "TransferQueue>=0.1.11",
+    "pyzmq",
+    "msgspec",
+    "accelerate",
+    "codetiming",
+    "datasets",
+    "dill",
+    "hydra-core",
+    "numpy>=2.0.0",
+    "pandas",
+    "peft",
+    "pyarrow>=19.0.0",
+    "pybind11",
+    "pylatexenc",
+    "transformers",
+    "ray[default]>=2.41.0",
+    "torchdata",
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "wandb",
+    "packaging>=20.0",
+    "tensorboard",
+    "fastapi",
+    "uvicorn",
+    "mathruler",
+    "qwen_vl_utils",
+    "torchcodec",
+    "cachetools",
+    "einops",
+    "nvtx",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-rerunfailures",
+    # synced from pinned verl (end)
+]
+megatron = [
+    "verl[megatron]",
+    # synced from pinned verl (begin)
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "torchaudio==2.11.0",
+    "nvidia-mathdx",
+    "apex",
+    "transformer-engine==2.20.2",
+    "onnxscript",
+    "trl==0.27.0",
+    "matplotlib",
+    "liger-kernel==0.8.4",
+    "megatron-bridge==0.6.2",
+    "megatron-core",
+    "deep-ep==1.2.1",
+    "flash-linear-attention==0.5.2",
+    "megatron-energon==7.4.1",
+    "nvidia-modelopt==0.47.0",
+    "cupy-cuda13x==14.0.1",
+    "flash-attn==2.8.3",
+    "TransferQueue>=0.1.11",
+    "pyzmq",
+    "msgspec",
+    "accelerate",
+    "codetiming",
+    "datasets",
+    "dill",
+    "hydra-core",
+    "numpy>=2.0.0",
+    "pandas",
+    "peft",
+    "pyarrow>=19.0.0",
+    "pybind11",
+    "pylatexenc",
+    "transformers",
+    "ray[default]>=2.41.0",
+    "torchdata",
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "wandb",
+    "packaging>=20.0",
+    "tensorboard",
+    "fastapi",
+    "uvicorn",
+    "mathruler",
+    "qwen_vl_utils",
+    "torchcodec",
+    "cachetools",
+    "einops",
+    "nvtx",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-rerunfailures",
+    # synced from pinned verl (end)
+]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[project.urls]
+Repository = "https://github.com/verl-project/laminar"
+Issues = "https://github.com/verl-project/laminar/issues"
+Paper = "https://doi.org/10.1145/3767295.3803580"
+
+[project.scripts]
+laminar = "laminar.train.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"laminar.train" = ["config/*.yaml", "config/optimizer_defaults/*.yaml"]
+"laminar.eval" = ["config/*.yaml"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "I", "G"]
+ignore = ["F405", "F403", "E731", "B007", "UP032", "G004", "UP045", "UP035"]
+
+# Public source pins also select the backend configuration synchronized below.
+# Package versions alone cannot distinguish unreleased API changes.
+[tool.uv]
+# Backend settings below are synchronized from the public verl source pin.
+environments = [
+    "python_full_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+conflicts = []
+override-dependencies = [
+    "tilelang==0.1.15",
+    "transformers==5.16.1",
+    "tokenizers==0.23.2",
+    "numpy>=2.0.0",
+    "kernels>=0.14.1,<0.15",
+    "flash-attn-4 ; platform_machine == 'flash-attn-4-excluded'",
+    "nvidia-cusparselt-cu13==0.8.0 ; platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "nvidia-cusparselt-cu13==0.9.1 ; platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
+constraint-dependencies = [
+    "numpy<2.5",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "megatron-core"
+version = "0.19.2"
+requires-dist = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
+
+[[tool.uv.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.6.2"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "TransferQueue"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "deep-ep"
+version = "1.2.1"
+requires-dist = []
+
+[tool.uv.sources.deep-ep]
+index = "verl-wheelhouse"
+
+[tool.uv.sources.apex]
+index = "verl-wheelhouse"
+
+[tool.uv.sources.flash-attn]
+index = "verl-wheelhouse"
+
+[tool.uv.sources.transformer-engine]
+index = "verl-wheelhouse"
+
+[tool.uv.sources.megatron-bridge]
+index = "verl-wheelhouse"
+
+[tool.uv.sources.megatron-core]
+git = "https://github.com/NVIDIA/Megatron-LM.git"
+tag = "core_v0.19.2"
+
+[tool.uv.sources.torch]
+index = "pytorch-cu130"
+
+[tool.uv.sources.torchvision]
+index = "pytorch-cu130"
+
+[tool.uv.sources.torchaudio]
+index = "pytorch-cu130"
+
+[tool.uv.sources.verl]
+# TODO: switch back to https://github.com/verl-project/verl.git once upstream PRs are merged.
+git = "https://github.com/tongyx361/verl-laminar-hooks.git"
+rev = "4a8cf3c6fa99960caf22c582ce6412124995565a"
+
+[tool.uv.sources.uni-agent]
+# TODO: switch back to https://github.com/verl-project/uni-agent.git once upstream PRs are merged.
+git = "https://github.com/tongyx361/uni-agent.git"
+rev = "9f4935f4286e0263d1f974c1efefd1c6128c4e7a"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "verl-wheelhouse"
+url = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/"
+explicit = true

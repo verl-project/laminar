@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use Laminar in your research, please cite the paper below."
+type: software
+title: Laminar
+version: 0.1.0
+license: Apache-2.0
+repository-code: https://github.com/verl-project/laminar
+url: https://github.com/verl-project/laminar
+authors: &authors
+  - family-names: Sheng
+    given-names: Guangming
+  - family-names: Tong
+    given-names: Yuxuan
+  - family-names: Wan
+    given-names: Borui
+  - family-names: Zhang
+    given-names: Wang
+  - family-names: Jia
+    given-names: Chaobo
+  - family-names: Wu
+    given-names: Xibin
+  - family-names: Wu
+    given-names: Yuqi
+  - family-names: Li
+    given-names: Xiang
+  - family-names: Zhang
+    given-names: Chi
+  - family-names: Peng
+    given-names: Yanghua
+  - family-names: Lin
+    given-names: Haibin
+  - family-names: Liu
+    given-names: Xin
+  - family-names: Wu
+    given-names: Chuan
+preferred-citation:
+  type: conference-paper
+  title: "Laminar: A Scalable Asynchronous RL Post-Training Framework"
+  authors: *authors
+  collection-title: Proceedings of the 21st European Conference on Computer Systems
+  collection-type: proceedings
+  year: 2026
+  month: 4
+  start: 400
+  end: 422
+  publisher:
+    name: Association for Computing Machinery
+  doi: 10.1145/3767295.3803580
+  url: https://doi.org/10.1145/3767295.3803580

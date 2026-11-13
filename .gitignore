@@ -1,0 +1,45 @@
+# Python & packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments & uv
+.venv/
+.venv-*
+venv/
+.uv/
+
+# Test, lint & type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Training, evaluation & local data artifacts
+outputs/
+wandb/
+checkpoints/
+logs/
+*.log
+*.pt
+*.ckpt
+*.safetensors
+*.parquet
+
+# Environment & editor files
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Operational context belongs outside the public product.
+.agent/
+.agents/
+SNAPSHOT.toml

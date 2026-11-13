@@ -1,0 +1,8 @@
+# @package _global_
+# Copyright (c) 2026 ByteDance Ltd. and/or its affiliates
+# SPDX-License-Identifier: Apache-2.0
+
+actor_rollout_ref:
+  actor:
+    optim:
+      use_checkpoint_opt_param_scheduler: True

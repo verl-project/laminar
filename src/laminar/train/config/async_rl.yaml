@@ -1,0 +1,8 @@
+# Primary Hydra entry; recipes may inherit async_rl_base.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - async_rl_base
+  - _self_

@@ -1,0 +1,176 @@
+# Async-RL trainer config.
+#
+# Inherits from ``ppo_trainer`` (the mainline verl PPO config) and layers
+# on the async-RL recipe's pieces: ``experience_buffer`` queue policy,
+# actor PPO/loss-scale overrides, and rollout/router lifecycle blocks tuned
+# for async execution (separate rollout pool, AgentLoop dispatcher, repack on).
+
+defaults:
+  - ppo_trainer
+  # Fall back to dp when raw YAML trees are merged outside Hydra compose.
+  - optional optimizer_defaults: ${oc.select:model_engine,dp}
+  - _self_
+
+# separate_async uses independent GPU pools; colocate_async rotates one pool
+# between inference and training while sessions and tools remain asynchronous.
+training_strategy: separate_async
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+  # Keep tokenizer chat templates enabled so RLHFDataset overlong-prompt
+  # filtering matches AgentLoop's later apply_chat_template. The prompt
+  # dataloader itself only collates raw_prompt rows.
+  apply_chat_template: True
+  return_raw_chat: True
+
+algorithm:  # Policy-based RL
+  # Async trainer currently supports the classic GRPO and RLOO outcome paths.
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: True
+
+experience_buffer:
+  _target_: laminar.train.experience_buffer.config.ExperienceBufferConfig
+  # Positive concrete backlog limit; 0/null are intentionally invalid.
+  max_size: 4096
+  # fifo / lifo / version_lifo. Sampling is global across the ready queue.
+  # version_lifo prefers the highest behavior-policy version, then newest-ready
+  # within it. Successful trajectories enter together only after their raw-uid
+  # prompt terminal closes the group.
+  sampler: fifo
+  # ExperienceBuffer consumes only the training experience-store namespace.
+  store_namespace: train
+
+# TODO(async_rl): add critic and ref-policy config support.
+
+actor_rollout_ref:
+  actor:
+    strategy: fsdp2
+    ppo_micro_batch_size_per_gpu: 1
+    # Async PPO objective uses the mainline actor loss; recipes may override
+    # clip ratios and loss aggregation.
+    clip_ratio_high: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_c: 3
+    loss_agg_mode: token-mean
+    loss_scale_factor: null
+  rollout:
+    name: vllm
+    # Rollout pool shape. The number of train rollout replicas is derived as
+    # ``n_gpus_per_node * nnodes / (TP * DP * PP)``.
+    n_gpus_per_node: 1
+    nnodes: 3
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    calculate_log_probs: True
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_micro_batch_size_per_gpu: 1
+    mode: async
+    enable_sleep_mode: True
+    # Runtime/KV snapshots are sourced from vLLM's scheduler statistics.
+    disable_log_stats: False
+    multi_turn:
+      enable: True
+    engine_kwargs:
+      vllm:
+        worker_extension_cls: laminar.train.relay.manager.AsyncRLvLLMColocateWorkerExtension
+
+rollout_dispatcher:
+  _target_: laminar.train.dispatcher.RolloutDispatcherConfig
+  # Interval for the AgentLoop rollout dispatcher loop.
+  schedule_interval_s: 5.0
+  state_batch_size: ${data.gen_batch_size}
+  # Dispatch fan-out per prompt; same knob as actor_rollout_ref.rollout.n.
+  num_samples_per_prompt: ${actor_rollout_ref.rollout.n}
+  # Pause new batches when every replica is at/above the Router KV threshold.
+  # Tracker snapshots lag by up to one poll (~1s); slight overshoot is expected.
+  pressure_admission_mode: ${rollout_router.dynamic_overload_admission.mode}
+  kv_cache_usage_threshold: ${rollout_router.dynamic_overload_admission.kv_cache_usage_threshold}
+
+rollout_router:
+  _target_: laminar.global_request_router.GlobalRequestRouterConfig
+  # Client-side retry budget for temporarily unavailable routes.
+  client_wait:
+    timeout_s: 600
+    planned_pause_timeout_s: 3600
+    initial_backoff_s: 0.1
+    max_backoff_s: 2.0
+  # Router-owned per-server KV placement preference. The dispatcher separately
+  # uses the same threshold as a whole-pool admission gate; existing sticky
+  # routes continue naturally in every mode.
+  dynamic_overload_admission:
+    mode: "off"  # off | enforce
+    max_snapshot_age_s: 5.0
+    kv_cache_usage_threshold: 0.80
+  # same_version | latest_version. A weight update aborts in-flight turns,
+  # which keep their generated tokens and continue. same_version pins each
+  # session to one weight version and uses Repack; latest_version keeps
+  # rollout on the newest weights available at each lease acquisition, so a
+  # continued trajectory can span versions.
+  continuation: same_version
+
+multi_version_rollout:
+  _target_: laminar.multi_version_rollout.MultiVersionRolloutManagerConfig
+  # Multi-version rollout lifecycle control: stale-server abort, direct load,
+  # and optional same-version request migration.
+  # Share the dispatcher cadence; entrypoints override the dispatcher owner only.
+  schedule_interval_s: ${rollout_dispatcher.schedule_interval_s}
+  repack:
+    _target_: laminar.multi_version_rollout.MultiVersionRolloutRepackConfig
+    # Move active same-version route bindings between rollout servers before
+    # loading stale weights. In-flight turns are aborted and continue from
+    # their generated tokens at the same weight version. Ignored under
+    # rollout_router.continuation=latest_version.
+    enable: True
+    # Repack uses instantaneous backend KV snapshots for same-version Best-Fit.
+    # Missing/invalid backend KV stats fail fast and terminate the job;
+    # post-repack usage is conservatively projected as source + destination.
+    source_max_kv_cache_usage: 0.5
+    destination_max_kv_cache_usage: 0.95
+
+relay:
+  # Transport backend for Relay weight sync: "ucx" (default) or "nccl".
+  backend: ucx
+  # Per-node RelayWorker Ray CPU reservation and OpenMP/MKL copy thread budget.
+  num_cpus: 1
+
+tracker:
+  # Inherit the trainer owner by default; an explicit override can still route
+  # Tracker output independently.
+  logger: ${trainer.logger}
+  dump:
+    # JSONL metric path. ``null`` disables file dump.
+    path: null
+    # Persistent runs require paths under a caller-declared writable mount root.
+    # Shell entrypoints enable the root check by default outside ECHO_ONLY.
+    require_persistent_path: false
+    persistent_roots: /mnt/hdfs
+  # Each train step concurrently pulls live snapshots from the dispatcher,
+  # buffer, rollout lifecycle manager, and Relay. A slow or unhealthy source
+  # is isolated by this independent per-source timeout.
+  remote_metrics_timeout_s: 5.0
+  # Opt-in UTF-8 key limit for a backend. Long paths receive reversible aliases;
+  # with a dump path, sanitized resolved config and mapping persist beside
+  # metrics, excluding runtime_env and credential values. Null leaves the
+  # backend config unprojected.
+  config_key_max_bytes: null
+
+trainer:
+  project_name: async_rl
+  experiment_name: async_rl
+  # Trainer pool shape. Rollout pool stays on actor_rollout_ref.rollout.
+  n_gpus_per_node: 2
+  nnodes: 1
+  # Per-worker environment overrides are optional, but the mapping itself is
+  # always present so the trainer does not need a second fallback default.
+  worker_env: {}
+  # Async rollout uses an infinite prompt stream. ``total_epochs`` must remain
+  # null; ``trainer.total_training_steps`` is the supported stopping bound.
+  total_epochs: null
+  # Publish updated actor weights to Relay every N train steps.
+  weight_publish_interval: 1
+
+timeout:
+  init_model: 600

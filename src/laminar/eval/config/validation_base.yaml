@@ -1,0 +1,115 @@
+# Standalone offline evaluation: only model, inference and result-store owners.
+defaults:
+  - model@actor_rollout_ref.model: hf_model
+  - rollout@actor_rollout_ref.rollout: rollout
+  - transfer_queue@transfer_queue: transfer_queue
+  - _self_
+
+actor_rollout_ref:
+  model:
+    path: ${oc.select:validation.checkpoints.0,null}
+  rollout:
+    name: vllm
+    mode: async
+    n: ${actor_rollout_ref.rollout.val_kwargs.n}
+    nnodes: 1
+    n_gpus_per_node: 1
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    calculate_log_probs: true
+    load_format: auto
+    enable_sleep_mode: false
+    free_cache_engine: false
+    disable_log_stats: false
+    multi_turn:
+      enable: true
+    agent:
+      agent_loop_manager_class: null
+    profiler:
+      ranks: []
+      finish_hook_ranks: []
+      tool_config:
+        npu:
+          contents: []
+        torch:
+          contents: []
+
+data:
+  max_prompt_length: 512
+  max_response_length: 512
+  return_raw_chat: true
+
+rollout_router:
+  _target_: laminar.global_request_router.GlobalRequestRouterConfig
+  # Client-side retry budget for temporarily unavailable routes.
+  client_wait:
+    timeout_s: 600
+    planned_pause_timeout_s: 3600
+    initial_backoff_s: 0.1
+    max_backoff_s: 2.0
+  dynamic_overload_admission:
+    mode: "off"
+    max_snapshot_age_s: 5.0
+    kv_cache_usage_threshold: 0.80
+
+timeout:
+  init_model: 3600
+
+validation:
+  # Mounted HF model directories (or trainer global_step_* dirs) with the same
+  # architecture and tokenizer. Pre-enqueued at startup; versions are 1, 2, ...
+  checkpoints: []
+  # Readable evaluation dataset parquet file (loaded with split="test").
+  data_path: ???
+  # Absolute output directory; must reside under validation.persistent_roots.
+  result_dir: ???
+  # Caller-declared persistent mount roots; an empty list is rejected.
+  persistent_roots: []
+  # Number of dataset prompts dispatched per rollout wave.
+  batch_size: 128
+  # Long-tail consolidation across replicas of the same checkpoint so drained
+  # replicas can start the next queued checkpoint before the previous tail finishes.
+  repack:
+    source_max_kv_cache_usage: 0.5
+    destination_max_kv_cache_usage: 0.95
+    schedule_interval_s: 5.0
+  # Per-stage timeout (seconds) for load, warmup, rollout batch, and drain.
+  stage_timeout_s: 7200
+  # Background service-level cumulative observations; never reset runner counters.
+  efficiency_interval_s: 60
+  # Caller-audited completed-prompt imports; paths are mounted immutable JSON.
+  resume_results: []
+  # Task/scorer/checkpoint identity bindings audited by the submitting owner.
+  resume_protocol: {}
+  # Persistent evaluation queue configuration:
+  # - Default (endpoint: null, coordinator_only: false): starts an embedded HTTP
+  #   queue coordinator thread (<result_dir>/queue/endpoint.txt) + worker control
+  #   in this driver; inference replicas run in the configured Ray GPU pool.
+  # - Disaggregated coordinator (coordinator_only: true): runs only the HTTP queue
+  #   service without initializing Ray or GPUs.
+  # - Disaggregated worker (endpoint: "http://<host>:<port>"): connects this Ray
+  #   worker to an external queue coordinator.
+  queue:
+    endpoint: null
+    # Exact resident/submission identity, shared by this worker's replica groups.
+    # Embedded mode generates a fresh identity when omitted; external workers
+    # must supply their own unique submission identity.
+    worker_id: null
+    # Optional native URI mapped by the submit owner to validation.result_dir.
+    result_uri: null
+    # Bind address and port for the HTTP queue coordinator (port 0 picks an ephemeral port).
+    server_host: "127.0.0.1"
+    server_port: null
+    coordinator_only: false
+    # Queue state directory (defaults to <validation.result_dir>/queue).
+    state_dir: null
+    # Optional training checkpoint directory to watch and auto-submit in companion mode.
+    watch_dir: null
+    # Optional training run roots watched for global_step_*/actor/model/huggingface
+    # (syncs bootstrap metadata and mirrors results into each run's validation/ dir).
+    watch_runs: []
+    watch_interval_s: 20.0
+    watch_include_base: false

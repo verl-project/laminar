@@ -1,0 +1,8 @@
+# Primary Hydra entry; recipes may inherit validation_base.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - validation_base
+  - _self_
