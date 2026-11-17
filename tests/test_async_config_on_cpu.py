@@ -308,6 +308,86 @@ def test_async_trainer_selects_actor_worker_by_strategy():
         _select_async_actor_worker_cls("unknown")
 
 
+@pytest.mark.parametrize("use_kl_loss", [False, True])
+def test_init_actor_workers_colocates_native_reference_only_for_kl(monkeypatch, use_kl_loss):
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _composed_async_rl_config()
+    trainer.config.actor_rollout_ref.actor.use_kl_loss = use_kl_loss
+    pool = object()
+    trainer.resource_pool_manager = SimpleNamespace(resource_pool_dict={}, get_resource_pool=lambda _: pool)
+    initialized, classes = [], {}
+    groups = {role: SimpleNamespace(init_model=lambda role=role: initialized.append(role)) for role in ("actor", "ref")}
+
+    def worker_group(resource_pool, **kwargs):
+        assert resource_pool is pool
+        return SimpleNamespace(spawn=lambda prefix_set: {role: groups[role] for role in prefix_set})
+
+    monkeypatch.setattr(
+        async_rl_trainer_module,
+        "create_colocated_worker_cls",
+        lambda class_dict: classes.update(class_dict),
+    )
+    trainer.ray_worker_group_cls = worker_group
+
+    trainer._init_actor_workers()
+
+    assert classes["actor"].kwargs["role"] == "actor"
+    assert initialized == (["ref", "actor"] if use_kl_loss else ["actor"])
+    if use_kl_loss:
+        assert classes["ref"].cls.__ray_actor_class__ is ActorRolloutRefWorker
+        assert classes["ref"].kwargs["role"] == "ref"
+        assert trainer.ref_wg is groups["ref"]
+    else:
+        assert "ref" not in classes
+        assert not hasattr(trainer, "ref_wg")
+
+
+@pytest.mark.parametrize("use_kl_loss", [False, True])
+def test_reference_log_probs_reach_actor_update_only_for_kl(monkeypatch, use_kl_loss):
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _composed_async_rl_config()
+    trainer.config.actor_rollout_ref.actor.use_kl_loss = use_kl_loss
+    trainer.config.actor_rollout_ref.actor.ppo_mini_batch_size = 2
+    trainer.config.actor_rollout_ref.rollout.n = 1
+    trainer.config.data.train_batch_size = 2
+    trainer.global_steps = 1
+    calls, updates = [], []
+
+    def compute_ref_log_prob(infer_td):
+        assert infer_td["input_ids"].is_nested
+        assert tu.get(infer_td, "calculate_entropy") is False
+        assert tu.get(infer_td, "compute_loss") is False
+        calls.append("ref")
+        return TensorDict({"log_probs": torch.arange(6, dtype=torch.float32)}, batch_size=[])
+
+    trainer.ref_wg = SimpleNamespace(compute_ref_log_prob=compute_ref_log_prob)
+    trainer.actor_wg = SimpleNamespace(update_actor=lambda td: updates.append(td))
+    monkeypatch.setattr(trainer, "_compute_old_log_probs", lambda td, metrics: None)
+    monkeypatch.setattr(trainer, "_apply_rollout_correction", lambda td, metrics: None)
+    td = TensorDict(
+        {
+            "prompts": torch.tensor([[11, 12], [0, 13]]),
+            "responses": torch.tensor([[21, 22, 0], [23, 0, 0]]),
+            "input_ids": torch.tensor([[11, 12, 21, 22, 0], [0, 13, 23, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 0], [0, 1, 1, 0, 0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3, 0], [0, 0, 1, 0, 0]]),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 0, 0]]),
+        },
+        batch_size=[2],
+    )
+
+    trainer._compute_actor_update_inputs(td, {})
+    trainer._update_actor(td, {})
+
+    assert updates[0] is td
+    assert not td["input_ids"].is_nested
+    assert calls == (["ref"] if use_kl_loss else [])
+    if use_kl_loss:
+        torch.testing.assert_close(td["ref_log_prob"], torch.tensor([[1.0, 2.0, 0.0], [4.0, 0.0, 0.0]]))
+    else:
+        assert "ref_log_prob" not in td
+
+
 def test_async_actor_init_model_is_blocking_before_relay_connect():
     attrs = getattr(AsyncActorWorker.init_model, MAGIC_ATTR)
 
@@ -1084,20 +1164,19 @@ def test_async_trainer_rejects_correction_without_rollout_log_probs():
         )
 
 
-def test_async_trainer_rejects_unsupported_ref_policy_kl():
-    for path in ("algorithm.use_kl_in_reward", "actor_rollout_ref.actor.use_kl_loss"):
-        config = _composed_async_rl_config()
-        OmegaConf.update(config, path, True)
+def test_async_trainer_rejects_kl_in_reward():
+    config = _composed_async_rl_config()
+    config.algorithm.use_kl_in_reward = True
 
-        with pytest.raises(ValueError, match="does not support ref-policy KL"):
-            AsyncRLTrainer(
-                config,
-                resource_pool_manager=None,
-                experience_buffer=None,
-                relay_client=None,
-                tracker=None,
-                trainer_config=AsyncRLTrainerConfig(),
-            )
+    with pytest.raises(ValueError, match="does not support KL in reward"):
+        AsyncRLTrainer(
+            config,
+            resource_pool_manager=None,
+            experience_buffer=None,
+            relay_client=None,
+            tracker=None,
+            trainer_config=AsyncRLTrainerConfig(),
+        )
 
 
 def test_train_batch_metrics_summarize_rewards_advantages():

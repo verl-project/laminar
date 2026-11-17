@@ -29,8 +29,7 @@ Responsibilities:
        publish new weights through the relay servers.
     6. Per-step metrics route through the centralized :class:`Tracker` actor.
 
-Critic and reference-policy branches are TODOs; the rest of the orchestration
-is self-contained on the driver event loop.
+Critic support remains a TODO; reference-policy KL uses verl's reference worker.
 """
 
 from __future__ import annotations
@@ -65,6 +64,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.profiler.performance import simple_timer
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from laminar.metrics import Aggregation, MetricSpec, export_flat_metrics, reduce_metric_snapshots
@@ -261,8 +261,8 @@ class AsyncRLTrainer:
         self.config = config
         if _rollout_correction_enabled(config) and not bool(config.actor_rollout_ref.rollout.calculate_log_probs):
             raise ValueError("decoupled rollout correction requires actor_rollout_ref.rollout.calculate_log_probs=True")
-        if bool(config.algorithm.use_kl_in_reward) or bool(config.actor_rollout_ref.actor.use_kl_loss):
-            raise ValueError("async_rl does not support ref-policy KL in reward or actor loss")
+        if bool(config.algorithm.use_kl_in_reward):
+            raise ValueError("async_rl does not support KL in reward; use actor.use_kl_loss")
         self.trainer_config = trainer_config
         self.resource_pool_manager = resource_pool_manager
         self.experience_buffer = experience_buffer
@@ -308,14 +308,9 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    # TODO(async_rl): restore the `use_reference_policy` property when the
-    # ref-policy branch is wired back in. Drive it from
-    # ``algorithm.use_kl_in_reward`` OR ``actor_rollout_ref.actor.use_kl_loss``.
-    # When True it should: (1) switch ``AsyncActorWorker`` role to ``actor_ref``
-    # so the parent ``ActorRolloutRefWorker`` builds the ref TrainingWorker,
-    # (2) compute ``ref_log_prob`` before trainer-side advantage estimation,
-    # (3) feed ``ref_log_prob`` into the actor mini-batch + KL-in-loss branch
-    # of the actor PPO loss, (4) optionally apply KL-in-reward before advantage.
+    @property
+    def use_reference_policy(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("use_kl_loss", False))
 
     @property
     def train_batch_size(self) -> int:
@@ -383,7 +378,7 @@ class AsyncRLTrainer:
             f"Initializing workers; resource pools: {list(self.resource_pool_manager.resource_pool_dict.keys())}"
         )
 
-        # Build cls→pool mapping. We only spawn actor today.
+        # Actor and reference workers share the existing trainer pool.
         # TODO(async_rl): add critic support.
         actor_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
         actor_worker_cls = _select_async_actor_worker_cls(actor_strategy)
@@ -393,6 +388,12 @@ class AsyncRLTrainer:
             role="actor",
         )
         actor_class_dict = {"actor": actor_cls}
+        if self.use_reference_policy:
+            actor_class_dict["ref"] = RayClassWithInitArgs(
+                cls=ray.remote(ActorRolloutRefWorker),
+                config=self.config.actor_rollout_ref,
+                role="ref",
+            )
 
         worker_dict_cls = create_colocated_worker_cls(class_dict=actor_class_dict)
         wg_kwargs = {}
@@ -408,13 +409,11 @@ class AsyncRLTrainer:
         )
         spawn_wg = self._wg_dict.spawn(prefix_set=actor_class_dict.keys())
         self.actor_wg = spawn_wg["actor"]
+        if self.use_reference_policy:
+            self.ref_wg = spawn_wg["ref"]
+            self.ref_wg.init_model()
         logger.info("%s group spawned for strategy=%s; calling init_model()", actor_worker_cls.__name__, actor_strategy)
         self.actor_wg.init_model()
-
-        # TODO(async_rl): when ref-policy support is added, spawn the actor with
-        # role="actor_ref" so the parent builds the ref TrainingWorker
-        # alongside the actor on the same pool.
-        # TODO(async_rl): add critic support.
 
     def _connect_relay(self) -> dict[str, TensorMeta]:
         """Connect actor ranks to Relay ingress and initialize actor-derived metadata."""
@@ -752,9 +751,7 @@ class AsyncRLTrainer:
             * ``response_mask`` (over the response window)
             * ``behav_log_probs`` / ``rollout_log_probs`` from rollout
 
-        TODO(async_rl): when ref-policy support is added, append ``ref_log_prob``
-        whenever the trainer has run ``_compute_ref_log_prob`` earlier in the
-        step (so the actor mini-batch carries it for KL-in-loss).
+        The read-only preparation phase later adds ``ref_log_prob`` for KL.
         """
         rollout_cfg = self.config.actor_rollout_ref.rollout
         require_routed_experts = bool(rollout_cfg.get("enable_rollout_routing_replay", False))
@@ -933,12 +930,13 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    # TODO(async_rl): restore ``_compute_ref_log_prob`` here when the
-    # ref-policy branch is wired back in. It should run
-    # ``self.actor_wg.compute_ref_log_prob(td)`` (the parent
-    # ``ActorRolloutRefWorker`` already exposes this method when role
-    # contains ``ref``) and make ``ref_log_prob`` available before either
-    # trainer-side KL-in-reward or KL-in-loss consumes it.
+    def _compute_ref_log_prob(self, td: TensorDict) -> None:
+        infer_td = td.clone(recurse=False)
+        if not infer_td["input_ids"].is_nested:
+            infer_td = left_right_2_no_padding(infer_td)
+        tu.assign_non_tensor(infer_td, calculate_entropy=False, compute_loss=False)
+        output = self.ref_wg.compute_ref_log_prob(infer_td)
+        td["ref_log_prob"] = no_padding_2_padding(tu.get(output, "log_probs"), infer_td).float()
 
     # TODO(async_rl): add critic update support.
 
@@ -1013,6 +1011,8 @@ class AsyncRLTrainer:
     def _compute_actor_update_inputs(self, td: TensorDict, metrics: dict) -> None:
         """Compute read-only actor inputs without blocking the driver event loop."""
         self._compute_old_log_probs(td, metrics)
+        if self.use_reference_policy:
+            self._compute_ref_log_prob(td)
         self._apply_rollout_correction(td, metrics)
         restore_train_mode = bool(metrics.get("old_log_prob/recomputed", 0.0))
         metrics["old_log_prob/restore_train_mode"] = float(restore_train_mode)

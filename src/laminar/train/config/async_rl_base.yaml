@@ -40,7 +40,7 @@ experience_buffer:
   # ExperienceBuffer consumes only the training experience-store namespace.
   store_namespace: train
 
-# TODO(async_rl): add critic and ref-policy config support.
+# TODO(async_rl): add critic support.
 
 actor_rollout_ref:
   actor:
@@ -53,6 +53,8 @@ actor_rollout_ref:
     clip_ratio_c: 3
     loss_agg_mode: token-mean
     loss_scale_factor: null
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
   rollout:
     name: vllm
     # Rollout pool shape. The number of train rollout replicas is derived as
