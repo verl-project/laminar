@@ -122,6 +122,45 @@ def test_train_config_preserves_explicit_megatron_checkpoint_scheduler(use_check
     assert config.actor_rollout_ref.actor.optim.use_checkpoint_opt_param_scheduler is use_checkpoint_scheduler
 
 
+@pytest.mark.parametrize(
+    ("trainer_async", "actor_async"),
+    [
+        pytest.param(None, None, id="default-sync"),
+        pytest.param(True, None, id="single-switch-async"),
+        pytest.param(False, False, id="legacy-explicit-sync"),
+        pytest.param(True, True, id="legacy-explicit-async"),
+        pytest.param(True, False, id="conflicting-worker-sync"),
+        pytest.param(False, True, id="conflicting-worker-async"),
+    ],
+)
+def test_train_config_binds_worker_checkpoint_mode_to_trainer_switch(trainer_async, actor_async):
+    from laminar.train.trainer import AsyncRLTrainer, AsyncRLTrainerConfig
+
+    overrides = ["model_engine=megatron", "actor_rollout_ref.actor.megatron.use_dist_checkpointing=True"]
+    if trainer_async is not None:
+        overrides.append(f"trainer.async_checkpoint={trainer_async}")
+    if actor_async is not None:
+        overrides.append(f"actor_rollout_ref.actor.checkpoint.async_save={actor_async}")
+    config = _compose_train(*overrides)
+    actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+    expected = bool(trainer_async)
+
+    assert config.trainer.async_checkpoint is expected
+    assert isinstance(actor_config, McoreActorConfig)
+    assert isinstance(actor_config.checkpoint, CheckpointConfig)
+    assert actor_config.checkpoint.async_save is (expected if actor_async is None else actor_async)
+
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = config
+    trainer.trainer_config = AsyncRLTrainerConfig.from_config(config)
+    assert trainer.async_checkpoint is expected
+    if actor_async is not None and actor_async != expected:
+        with pytest.raises(ValueError, match=r"actor.checkpoint.async_save must match trainer.async_checkpoint"):
+            trainer._validate_checkpoint_config()
+    else:
+        trainer._validate_checkpoint_config()
+
+
 def test_train_config_maps_nondefault_algorithm_repack_and_rollout_shape():
     config = _compose_train(
         "algorithm.norm_adv_by_std_in_grpo=True",
