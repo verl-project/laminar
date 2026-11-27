@@ -19,6 +19,7 @@ import asyncio
 import gc
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,7 +28,7 @@ from verl.single_controller.base.decorator import Dispatch, Execute, make_nd_com
 from verl.utils.device import get_torch_device
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.torch_dtypes import PrecisionType
-from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
 from laminar.train.relay import ActorPublishStats
 from laminar.train.relay.manager import _ThrottledWaitLogger
@@ -55,6 +56,34 @@ logger = logging.getLogger(__name__)
 _RELAY_CONNECT_TIMEOUT_S = 30.0
 
 
+class _NativeCheckpointTrainingWorker(TrainingWorker):
+    """Keep HF bootstrap independent of the native restart-checkpoint format."""
+
+    def reset(self):
+        engine = self.engine
+        engine_config = engine.engine_config
+        if not engine_config.use_dist_checkpointing or engine_config.dist_checkpointing_path is not None:
+            return super().reset()
+
+        # Pinned verl also uses the output-format flag to select its initial
+        # weights loader. Override only that instance's module-building call:
+        # optimizer/manager construction must still see the native format.
+        build_module = engine._build_megatron_module
+
+        def build_from_hf():
+            engine.engine_config = replace(engine_config, use_dist_checkpointing=False)
+            try:
+                return build_module()
+            finally:
+                engine.engine_config = engine_config
+
+        engine._build_megatron_module = build_from_hf
+        try:
+            return super().reset()
+        finally:
+            engine._build_megatron_module = build_module
+
+
 class AsyncMegatronActorWorker(ActorRolloutRefWorker):
     """Megatron ``ActorRolloutRefWorker`` plus Relay full-weight publish.
 
@@ -65,6 +94,8 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
     whole tensors straight into Relay's full-state storage.
     """
 
+    actor_worker_cls = _NativeCheckpointTrainingWorker
+
     def __init__(
         self,
         config: DictConfig,
@@ -74,6 +105,7 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
         self.is_sending_to_relay = False
         self.relay_server_address: tuple[str, int] | None = None
         self._first_actor_update_memory_logged = False
+        self._async_checkpoint_manager = None
 
     @property
     def _actor_engine(self):
@@ -88,8 +120,63 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
             torch.cuda.current_blas_handle()
             self._log_cuda_memory("cublas_prewarm_after")
         super().init_model()
+        checkpoint_manager = getattr(self._actor_engine, "checkpoint_mananager", None)
+        if checkpoint_manager is not None and bool(checkpoint_manager.checkpoint_config.async_save):
+            if not checkpoint_manager.use_dist_checkpointing or checkpoint_manager.use_megatron_fsdp:
+                raise ValueError("async checkpoint requires Megatron dist checkpointing without Megatron-FSDP")
+            if checkpoint_manager.peft_cls is not None:
+                raise ValueError("async checkpoint does not support PEFT")
+            if not checkpoint_manager.use_checkpoint_opt_param_scheduler:
+                raise ValueError("async checkpoint requires use_checkpoint_opt_param_scheduler=True")
+            enable_trainer_owned_writer = getattr(
+                checkpoint_manager, "enable_trainer_owned_threaded_checkpointing", None
+            )
+            if not callable(enable_trainer_owned_writer):
+                raise RuntimeError(
+                    "trainer.async_checkpoint requires a verl build with trainer-owned Megatron threaded checkpoints"
+                )
+            enable_trainer_owned_writer(cache_plans=True)
+            self._async_checkpoint_manager = checkpoint_manager
         self._prewarm_grad_stats_communicators()
         assert self.loss_fn is not None, "ActorRolloutRefWorker.init_model() did not register a loss function"
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        result = super().load_checkpoint(local_path, hdfs_path, del_local_after_load)
+        if self._async_checkpoint_manager is not None:
+            # Native optimizer loading creates temporary allocations. Release
+            # their cached blocks before NCCL allocates for the first forward.
+            torch.cuda.synchronize()
+            aggressive_empty_cache(force_sync=True)
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        manager = self._async_checkpoint_manager
+        if manager is None:
+            return super().save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        started = time.perf_counter()
+        super().save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        return {
+            "checkpoint/worker_stage_time_s": time.perf_counter() - started,
+            **manager.threaded_checkpoint_metrics,
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    def finalize_checkpoint(self) -> dict[str, float]:
+        """Finish native writes between actor RPCs, with all ranks participating."""
+        manager = self._async_checkpoint_manager
+        if manager is None:
+            return {}
+        started = time.perf_counter()
+        if not manager.finalize_async_checkpoint(blocking=True):
+            raise RuntimeError("Blocking checkpoint finalization left pending writes")
+        return {
+            "checkpoint/worker_finalize_time_s": time.perf_counter() - started,
+            "checkpoint/worker_async_request_count": manager.threaded_checkpoint_metrics.get(
+                "checkpoint/worker_async_request_count", 0.0
+            ),
+        }
 
     def _prewarm_grad_stats_communicators(self) -> None:
         if not torch.cuda.is_available():
@@ -105,6 +192,14 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
         for group in self._grad_stats_parallel_groups(optimizer):
             if all(group is not existing_group for existing_group in groups):
                 groups.append(group)
+        if getattr(self, "_async_checkpoint_manager", None) is not None:
+            # Threaded checkpoint staging and finalization synchronize status on
+            # the default group; prewarm it before training caches GPU segments.
+            world_group = torch.distributed.group.WORLD
+            if world_group is None:
+                raise RuntimeError("Megatron default process group is missing")
+            if all(world_group is not existing_group for existing_group in groups):
+                groups.append(world_group)
         if not groups:
             raise RuntimeError("Megatron optimizer has no grad-stats process groups")
 

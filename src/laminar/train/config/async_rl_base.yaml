@@ -46,6 +46,9 @@ actor_rollout_ref:
   actor:
     strategy: fsdp2
     ppo_micro_batch_size_per_gpu: 1
+    checkpoint:
+      # verl worker setting derived from the Laminar trainer's opt-in.
+      async_save: ${trainer.async_checkpoint}
     # Async PPO objective uses the mainline actor loss; recipes may override
     # clip ratios and loss aggregation.
     clip_ratio_high: 0.2
@@ -171,6 +174,11 @@ trainer:
   total_epochs: null
   # Publish updated actor weights to Relay every N train steps.
   weight_publish_interval: 1
+  # Opt-in async writes for native Megatron restart checkpoints. Select
+  # actor.megatron.use_dist_checkpointing=true and save_freq=1 for per-step saves.
+  # One CPU snapshot overlaps training; the next save applies backpressure.
+  # HF export remains an independent, synchronous operation.
+  async_checkpoint: false
 
 timeout:
   init_model: 600

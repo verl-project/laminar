@@ -83,6 +83,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _PendingCheckpoint:
+    step: int
+    directory: Path
+    dispatcher_task: asyncio.Future
+    started_at: float
+    stage_time_s: float
+    worker_metrics: dict[str, float]
+
+
+def _checkpoint_worker_metrics(rank_metrics: list[dict[str, float]] | None) -> dict[str, float]:
+    """Report critical-rank latency and actual rank-local snapshot bytes."""
+    if not rank_metrics:
+        return {}
+    result = {}
+    for key in ("worker_stage_time_s", "worker_finalize_time_s", "worker_async_request_count"):
+        metric = f"checkpoint/{key}"
+        values = [metrics[metric] for metrics in rank_metrics if metric in metrics]
+        if values:
+            result[metric] = max(values)
+    for key in ("worker_snapshot_bytes", "worker_cpu_snapshot_copy_bytes"):
+        metric = f"checkpoint/{key}"
+        values = [metrics[metric] for metrics in rank_metrics if metric in metrics]
+        if values:
+            result[metric] = sum(values)
+    return result
+
+
 def _select_async_actor_worker_cls(actor_strategy: str) -> type:
     strategy = str(actor_strategy).lower()
     if strategy in {"fsdp", "fsdp2"}:
@@ -221,6 +249,7 @@ class AsyncRLTrainerConfig:
     max_actor_ckpt_to_keep: int | None = None
     balance_batch: bool = True
     training_strategy: str = "separate_async"
+    async_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         if self.weight_publish_interval <= 0:
@@ -239,6 +268,7 @@ class AsyncRLTrainerConfig:
             ),
             balance_batch=bool(trainer_cfg.balance_batch),
             training_strategy=str(config.get("training_strategy", "separate_async")),
+            async_checkpoint=bool(trainer_cfg.get("async_checkpoint", False)),
         )
 
 
@@ -279,6 +309,7 @@ class AsyncRLTrainer:
         self.rollout_dispatcher: ActorHandle | None = None
         self._prepared = False
         self._pending_checkpoint_metrics: dict[str, Any] | None = None
+        self._pending_checkpoint: _PendingCheckpoint | None = None
         self._colocate_rollout_manager: ActorHandle | None = None
         self._rollout_weight_version = 0
 
@@ -289,6 +320,10 @@ class AsyncRLTrainer:
     @property
     def colocate(self) -> bool:
         return self.trainer_config.training_strategy == "colocate_async"
+
+    @property
+    def async_checkpoint(self) -> bool:
+        return bool(getattr(self.trainer_config, "async_checkpoint", False))
 
     async def _resume_colocate_rollout(self) -> None:
         # Publish/checkpoint operations may load actor tensors back to CUDA.
@@ -350,7 +385,7 @@ class AsyncRLTrainer:
         *,
         checkpoint_due: bool,
     ) -> bool:
-        if checkpoint_due:
+        if checkpoint_due and not self.async_checkpoint:
             return True
         if total_steps is not None and step >= total_steps:
             return False
@@ -534,8 +569,22 @@ class AsyncRLTrainer:
                 "trainer checkpoint requires actor checkpoint save/load contents "
                 f"{sorted(required)}; save={sorted(save_contents)} load={sorted(load_contents)}"
             )
-        if bool(actor_cfg.checkpoint.async_save):
-            raise ValueError("async-RL trainer checkpoint requires actor checkpoint.async_save=False")
+        if bool(actor_cfg.checkpoint.async_save) != self.async_checkpoint:
+            raise ValueError(
+                "actor.checkpoint.async_save must match trainer.async_checkpoint. "
+                "Set trainer.async_checkpoint to select the save mode."
+            )
+        if self.async_checkpoint:
+            if str(actor_cfg.strategy) != "megatron":
+                raise ValueError("trainer.async_checkpoint requires a Megatron actor")
+            if not bool(actor_cfg.megatron.use_dist_checkpointing):
+                raise ValueError("trainer.async_checkpoint requires actor.megatron.use_dist_checkpointing=True")
+            if "hf_model" in save_contents | load_contents:
+                raise ValueError("trainer.async_checkpoint does not support synchronous hf_model export")
+            if save_contents != required or load_contents != required:
+                raise ValueError("trainer.async_checkpoint save/load contents must be exactly model, optimizer, extra")
+            if bool(actor_cfg.megatron.get("use_megatron_fsdp", False)):
+                raise ValueError("trainer.async_checkpoint does not support Megatron-FSDP")
         if str(actor_cfg.strategy) == "megatron" and not bool(actor_cfg.optim.use_checkpoint_opt_param_scheduler):
             raise ValueError("Megatron trainer checkpoint requires actor.optim.use_checkpoint_opt_param_scheduler=True")
 
@@ -611,6 +660,8 @@ class AsyncRLTrainer:
 
     async def _save_checkpoint(self) -> dict[str, Any]:
         """Save the actor train state and prompt cursor using the verl layout."""
+        if self.async_checkpoint:
+            return await self._stage_checkpoint()
         if self.rollout_dispatcher is None:
             raise RuntimeError("AsyncRLTrainer.connect_checkpoint_sources must run before checkpointing")
         self._validate_checkpoint_storage_config()
@@ -651,32 +702,125 @@ class AsyncRLTrainer:
         if actor_error is not None:
             raise actor_error
 
+        return self._commit_checkpoint(step=self.global_steps, checkpoint_dir=checkpoint_dir, save_started=save_started)
+
+    def _commit_checkpoint(self, *, step: int, checkpoint_dir: Path, save_started: float) -> dict[str, Any]:
+        checkpoint_root = checkpoint_dir.parent
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         # Advance the marker only after both actor state and data.pt completed.
         tracker_file = get_checkpoint_tracker_filename(str(checkpoint_root))
         temp_tracker_file = tracker_file + ".tmp"
         with open(temp_tracker_file, "w") as f:
-            f.write(f"{self.global_steps}\n")
+            f.write(f"{step}\n")
         os.rename(temp_tracker_file, tracker_file)
         retention_pruned_count, retention_failed_count = self._prune_complete_local_checkpoints(
             checkpoint_root,
-            current_step=self.global_steps,
+            current_step=step,
         )
         save_time_s = time.perf_counter() - save_started
         logger.info(
             "Saved async-RL trainer checkpoint step=%s path=%s time_s=%.3f",
-            self.global_steps,
+            step,
             checkpoint_dir,
             save_time_s,
         )
         return {
             "checkpoint/completed": 1.0,
-            "checkpoint/step": float(self.global_steps),
+            "checkpoint/step": float(step),
             "checkpoint/save_time_s": save_time_s,
             "checkpoint/path": str(checkpoint_dir),
             "checkpoint/retention_pruned_count": float(retention_pruned_count),
             "checkpoint/retention_failed_count": float(retention_failed_count),
         }
+
+    async def _stage_checkpoint(self) -> dict[str, Any]:
+        """Bound host memory to one immutable native Megatron snapshot.
+
+        Native save returns after its CPU staging fence. Only the detached
+        snapshot is written in the background; actor mutation may then resume.
+        Relay publication is independent of this restart-only checkpoint.
+        """
+        if self.rollout_dispatcher is None:
+            raise RuntimeError("AsyncRLTrainer.connect_checkpoint_sources must run before checkpointing")
+        self._validate_checkpoint_storage_config()
+        backpressure_started = time.perf_counter()
+        await self._finish_pending_checkpoint()
+        backpressure_time_s = time.perf_counter() - backpressure_started
+        step = self.global_steps
+        checkpoint_dir = self._checkpoint_root() / f"global_step_{step}"
+        save_started = time.perf_counter()
+        dispatcher_task = asyncio.ensure_future(
+            self.rollout_dispatcher.save_checkpoint.remote(str(checkpoint_dir / "data.pt"))
+        )
+        try:
+            # Do not offload this call concurrently with actor update/collectives.
+            # Every rank must finish staging before the worker group returns.
+            worker_metrics = self.actor_wg.save_checkpoint(
+                local_path=str(checkpoint_dir / "actor"),
+                hdfs_path=None,
+                global_step=step,
+                max_ckpt_to_keep=None,
+            )
+        except BaseException as actor_error:
+            try:
+                await asyncio.to_thread(self.actor_wg.finalize_checkpoint)
+            except BaseException as finalize_error:
+                actor_error.add_note(f"actor checkpoint cleanup also failed: {finalize_error!r}")
+            try:
+                await dispatcher_task
+            except BaseException as dispatcher_error:
+                actor_error.add_note(f"prompt cursor checkpoint also failed: {dispatcher_error!r}")
+            raise
+        stage_time_s = time.perf_counter() - save_started
+        worker_metrics = _checkpoint_worker_metrics(worker_metrics)
+        self._pending_checkpoint = _PendingCheckpoint(
+            step, checkpoint_dir, dispatcher_task, save_started, stage_time_s, worker_metrics
+        )
+        return {
+            **worker_metrics,
+            "checkpoint/scheduled": 1.0,
+            "checkpoint/staged_step": float(step),
+            "checkpoint/stage_time_s": stage_time_s,
+            "checkpoint/backpressure_time_s": backpressure_time_s,
+        }
+
+    async def _finish_pending_checkpoint(self) -> dict[str, Any]:
+        """Finalize all ranks and the cursor before publishing the latest marker."""
+        pending = getattr(self, "_pending_checkpoint", None)
+        if pending is None:
+            return {}
+        wait_started = time.perf_counter()
+        # Both owners must settle even when one fails. A failed checkpoint stays
+        # pending and cannot advance the marker or cause retention of its parent.
+        actor_result, cursor_result = await asyncio.gather(
+            asyncio.to_thread(self.actor_wg.finalize_checkpoint),
+            pending.dispatcher_task,
+            return_exceptions=True,
+        )
+        if isinstance(actor_result, BaseException):
+            if isinstance(cursor_result, BaseException):
+                actor_result.add_note(f"prompt cursor checkpoint also failed: {cursor_result!r}")
+            raise actor_result
+        if isinstance(cursor_result, BaseException):
+            raise cursor_result
+        metrics = self._commit_checkpoint(
+            step=pending.step, checkpoint_dir=pending.directory, save_started=pending.started_at
+        )
+        metrics["checkpoint/stage_time_s"] = pending.stage_time_s
+        metrics.update(pending.worker_metrics)
+        metrics.update(_checkpoint_worker_metrics(actor_result))
+        metrics["checkpoint/finalize_wait_time_s"] = time.perf_counter() - wait_started
+        self._pending_checkpoint = None
+        await cast(
+            Any,
+            self.tracker.record_event.remote(
+                step=pending.step,
+                event_type="checkpoint_completed",
+                event_id=f"checkpoint:{pending.step}",
+                metrics=metrics,
+            ),
+        )
+        return metrics
 
     async def _load_checkpoint(self) -> bool:
         """Restore the actor train state and prompt cursor, if configured."""
@@ -1153,7 +1297,7 @@ class AsyncRLTrainer:
         return metrics, total_gpus
 
     async def _save_checkpoint_and_resume_rollout(self, *, checkpoint_due: bool, is_last_step: bool) -> None:
-        """Finish checkpoint I/O before handing colocated GPUs back to rollout."""
+        """Stage checkpoints before handing colocated GPUs back to rollout."""
         # Trainer checkpoint I/O is a causal tail after this step's committed
         # metrics row. Its complete latency is carried to the next row and
         # is never back-written into timing/step.
@@ -1164,8 +1308,12 @@ class AsyncRLTrainer:
                 Any,
                 self.tracker.record_event.remote(
                     step=self.global_steps,
-                    event_type="checkpoint_completed",
-                    event_id=f"checkpoint:{self.global_steps}",
+                    event_type="checkpoint_scheduled" if self.async_checkpoint else "checkpoint_completed",
+                    event_id=(
+                        f"checkpoint-scheduled:{self.global_steps}"
+                        if self.async_checkpoint
+                        else f"checkpoint:{self.global_steps}"
+                    ),
                     metrics=checkpoint_metrics,
                 ),
             )
@@ -1174,6 +1322,12 @@ class AsyncRLTrainer:
                 self.global_steps,
                 checkpoint_metrics,
             )
+
+        if is_last_step and self.async_checkpoint:
+            completed_metrics = await self._finish_pending_checkpoint()
+            if self._pending_checkpoint_metrics is None:
+                self._pending_checkpoint_metrics = {}
+            self._pending_checkpoint_metrics.update(completed_metrics)
 
         if self.colocate and not is_last_step:
             resume_start = time.perf_counter()
@@ -1221,7 +1375,12 @@ class AsyncRLTrainer:
         """Main training-loop implementation on the driver event loop."""
         fit_started_at = time.perf_counter()
         save_freq = self.config.trainer.save_freq
-        if save_freq and save_freq > 0 and save_freq % self.trainer_config.weight_publish_interval != 0:
+        if (
+            not self.async_checkpoint
+            and save_freq
+            and save_freq > 0
+            and save_freq % self.trainer_config.weight_publish_interval != 0
+        ):
             raise ValueError(
                 "trainer.save_freq must align with trainer.weight_publish_interval so every "
                 "trainer checkpoint has an exact committed Relay version: "
@@ -1354,7 +1513,9 @@ class AsyncRLTrainer:
                     )
             logger.info("AsyncRLTrainer step=%s schedule_relay_publish: done", self.global_steps)
 
-            # 6. Fence the Relay version needed by a trainer checkpoint.
+            # 6. Snapshot/export collectives must not interleave. Async
+            # checkpointing fences only an already scheduled Relay publish;
+            # it does not force a publication outside the configured cadence.
             if checkpoint_due or self.colocate:
                 relay_wait_time_s = await self._wait_for_pending_relay_publish(metrics)
                 timing_raw["wait_for_current_relay"] = relay_wait_time_s

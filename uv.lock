@@ -1768,10 +1768,10 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'fsdp'" },
     { name = "uvicorn", marker = "extra == 'megatron'" },
     { name = "uvicorn", marker = "extra == 'vllm'" },
-    { name = "verl", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=4a8cf3c6fa99960caf22c582ce6412124995565a" },
-    { name = "verl", extras = ["fsdp"], marker = "extra == 'fsdp'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=4a8cf3c6fa99960caf22c582ce6412124995565a" },
-    { name = "verl", extras = ["megatron"], marker = "extra == 'megatron'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=4a8cf3c6fa99960caf22c582ce6412124995565a" },
-    { name = "verl", extras = ["vllm"], marker = "extra == 'vllm'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=4a8cf3c6fa99960caf22c582ce6412124995565a" },
+    { name = "verl", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=5b7aa067e5b8afe1f3b4304e025ead0d92ff2798" },
+    { name = "verl", extras = ["fsdp"], marker = "extra == 'fsdp'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=5b7aa067e5b8afe1f3b4304e025ead0d92ff2798" },
+    { name = "verl", extras = ["megatron"], marker = "extra == 'megatron'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=5b7aa067e5b8afe1f3b4304e025ead0d92ff2798" },
+    { name = "verl", extras = ["vllm"], marker = "extra == 'vllm'", git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=5b7aa067e5b8afe1f3b4304e025ead0d92ff2798" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.32.0" },
     { name = "wandb", marker = "extra == 'fsdp'" },
     { name = "wandb", marker = "extra == 'megatron'" },
@@ -4411,7 +4411,7 @@ wheels = [
 [[package]]
 name = "verl"
 version = "0.10.0.dev0"
-source = { git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=4a8cf3c6fa99960caf22c582ce6412124995565a#4a8cf3c6fa99960caf22c582ce6412124995565a" }
+source = { git = "https://github.com/tongyx361/verl-laminar-hooks.git?rev=5b7aa067e5b8afe1f3b4304e025ead0d92ff2798#5b7aa067e5b8afe1f3b4304e025ead0d92ff2798" }
 dependencies = [
     { name = "accelerate" },
     { name = "codetiming" },

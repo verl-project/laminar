@@ -263,7 +263,7 @@ index = "pytorch-cu130"
 [tool.uv.sources.verl]
 # TODO: switch back to https://github.com/verl-project/verl.git once upstream PRs are merged.
 git = "https://github.com/tongyx361/verl-laminar-hooks.git"
-rev = "4a8cf3c6fa99960caf22c582ce6412124995565a"
+rev = "5b7aa067e5b8afe1f3b4304e025ead0d92ff2798"
 
 [tool.uv.sources.uni-agent]
 # TODO: switch back to https://github.com/verl-project/uni-agent.git once upstream PRs are merged.

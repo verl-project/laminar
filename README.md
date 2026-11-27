@@ -24,7 +24,7 @@ Laminar scales RL post-training to large clusters through a decoupled, asynchron
   - **Concurrent multi-checkpoint evaluation (`laminar.eval`)**: Applies version-pinned routing and tail repacking across checkpoints for bubble-free offline batch and online streaming evaluation (see [docs/evaluation.md](docs/evaluation.md)).
 - **Fault-Tolerant Execution**: Prevents single-replica failures from stalling cluster-wide progress.
   - **Inference engines**: Recover failed replicas from `Relay` (training) or checkpoint storage (evaluation) while preserving in-flight trajectory prefixes.
-  - **Trainer engine**: Resumes from the latest checkpoint (WIP: asynchronous per-step checkpoint).
+  - **Trainer engine**: Resumes from the latest checkpoint, with opt-in [asynchronous per-step Megatron checkpoints](docs/checkpointing.md).
 
 In SWE agent training (`Qwen3-Coder-30B-A3B-Instruct` on SWE-rebench, evaluated on SWE-bench Verified on 64×H800):
 
