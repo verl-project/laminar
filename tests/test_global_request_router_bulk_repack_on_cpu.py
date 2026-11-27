@@ -211,3 +211,23 @@ def test_bulk_idle_gates_and_latest_route_retirement(continuation: str) -> None:
         router.release_lease("inflight-only", "running")
         router.try_mark_updating("inflight-only", expected_version=1)
         assert router._server_states["inflight-only"].lifecycle == UPDATING
+
+
+def test_repack_orders_sources_by_best_fit_decreasing() -> None:
+    versions = {"s0": 1, "s1": 1, "s2": 1}
+    router = _router(versions)
+    for index, server_id in enumerate(("s0", "s1", "s2"), start=1):
+        _bind_to(
+            router, versions, session_id=f"r-{server_id}", server_id=server_id, weight_version=1, snapshot_version=index
+        )
+    router.update_routing_snapshot(
+        {
+            "s0": _snapshot("s0", kv=0.2, version=4),
+            "s1": _snapshot("s1", kv=0.4, version=4),
+            "s2": _snapshot("s2", kv=0.5, version=4),
+        }
+    )
+    plan = router.plan_and_begin_repack(
+        loadable_version=2, source_max_kv_cache_usage=0.45, destination_max_kv_cache_usage=0.9
+    )
+    assert plan.groups == (CommittedRepackGroup(sources=("s1",), destination="s2", weight_version=1),)

@@ -77,7 +77,7 @@ def _plan_repack_groups(
     destination_max_kv_cache_usage: float,
     excluded_servers: frozenset[str],
 ) -> list[CommittedRepackGroup]:
-    """Plan same-version Best-Fit groups without mutating Router state."""
+    """Plan same-version Best-Fit Decreasing groups without mutating Router state."""
     version_groups: dict[int, list[tuple[_RepackServerView, float]]] = {}
     for server in servers:
         if server.server_id in excluded_servers:
@@ -97,9 +97,12 @@ def _plan_repack_groups(
     for version in sorted(version_groups):
         servers_in_version = version_groups[version]
         source_candidates = sorted(
-            (kv_cache_usage, server.server_id)
-            for server, kv_cache_usage in servers_in_version
-            if server.route_count != 0 and kv_cache_usage <= source_max_kv_cache_usage
+            (
+                (kv_cache_usage, server.server_id)
+                for server, kv_cache_usage in servers_in_version
+                if server.route_count != 0 and kv_cache_usage <= source_max_kv_cache_usage
+            ),
+            key=lambda candidate: (-candidate[0], candidate[1]),
         )
         if not source_candidates or len(servers_in_version) < 2:
             continue
