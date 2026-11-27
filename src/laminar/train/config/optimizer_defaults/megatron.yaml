@@ -6,3 +6,7 @@ actor_rollout_ref:
   actor:
     optim:
       use_checkpoint_opt_param_scheduler: True
+  ref:
+    megatron:
+      dtype: ${actor_rollout_ref.actor.megatron.dtype}
+      sequence_parallel: ${actor_rollout_ref.actor.megatron.sequence_parallel}

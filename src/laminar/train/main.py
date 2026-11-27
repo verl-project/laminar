@@ -61,7 +61,12 @@ from laminar.train.experience_buffer.server import ExperienceBufferServer
 from laminar.train.relay import RelayClient, RelayManager
 from laminar.train.relay.transport import ucx_job_runtime_env_vars_from_env
 from laminar.train.tracker import Tracker, TrackerConfig
-from laminar.train.trainer import AsyncRLTrainer, AsyncRLTrainerConfig
+from laminar.train.trainer import (
+    AsyncRLTrainer,
+    AsyncRLTrainerConfig,
+    _check_megatron_token_cap,
+    validate_actor_reference_config,
+)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -442,36 +447,13 @@ def resolve_train_config(config: DictConfig) -> DictConfig:
     strategy = str(actor.get("strategy", "fsdp2"))
     if strategy not in {"fsdp", "fsdp2", "megatron"}:
         raise ValueError(f"actor.strategy must be fsdp, fsdp2, or megatron, got {strategy!r}")
-    if strategy != "megatron" and actor.get("megatron") is not None:
-        with open_dict(actor):
-            del actor["megatron"]
+    if strategy != "megatron":
+        for section in (actor, config.actor_rollout_ref.get("ref")):
+            if section is not None and section.get("megatron") is not None:
+                with open_dict(section):
+                    del section["megatron"]
 
-    OmegaConf.resolve(config)
-    _validate_training_strategy(config)
-
-    # Validate task recipe path early when the uni-agent task runner is configured.
-    task_config_path = OmegaConf.select(
-        config,
-        "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path",
-    )
-    if task_config_path is not None and (
-        not isinstance(task_config_path, str)
-        or not task_config_path
-        or not Path(task_config_path).is_file()
-        or not os.access(task_config_path, os.R_OK)
-    ):
-        raise ValueError("task_config_path must name an existing readable task recipe")
-
-    relay_backend_cfg = OmegaConf.select(config, "relay.backend")
-    if relay_backend_cfg is not None and str(relay_backend_cfg) not in {"ucx", "nccl"}:
-        raise ValueError(f"relay.backend must be 'ucx' or 'nccl', got {relay_backend_cfg!r}")
-    relay_num_cpus_cfg = OmegaConf.select(config, "relay.num_cpus")
-    if relay_num_cpus_cfg is not None and (
-        isinstance(relay_num_cpus_cfg, bool) or not isinstance(relay_num_cpus_cfg, int) or relay_num_cpus_cfg < 1
-    ):
-        raise ValueError("relay.num_cpus must be a positive integer")
-
-    # Apply Megatron engine/optimizer defaults and validate Megatron-Bridge requirement.
+    # Populate actor source-of-truth defaults before OmegaConf.resolve so ref/rollout interpolations inherit them.
     if strategy == "megatron":
         megatron = actor.megatron
         if megatron.get("use_mbridge") is not True:
@@ -520,34 +502,54 @@ def resolve_train_config(config: DictConfig) -> DictConfig:
                 if actor.optim.override_optimizer_config.get(key) is None:
                     actor.optim.override_optimizer_config[key] = value
 
-    # Derive per-GPU dynamic batching token caps from sequence/context parallelism when unset.
+    derived_token_cap = _seq_token_cap_resolver(_root_=config)
+    if actor.get("ppo_max_token_len_per_gpu") is None:
+        actor.ppo_max_token_len_per_gpu = derived_token_cap
+
+    OmegaConf.resolve(config)
+    if rollout.get("log_prob_max_token_len_per_gpu") is None:
+        rollout.log_prob_max_token_len_per_gpu = int(actor.ppo_max_token_len_per_gpu)
+    if (ref := config.actor_rollout_ref.get("ref")) is not None and ref.get("log_prob_max_token_len_per_gpu") is None:
+        ref.log_prob_max_token_len_per_gpu = int(actor.ppo_max_token_len_per_gpu)
+
+    _validate_training_strategy(config)
+    validate_actor_reference_config(config)
+
+    # Validate task recipe path early when the uni-agent task runner is configured.
+    task_config_path = OmegaConf.select(
+        config,
+        "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path",
+    )
+    if task_config_path is not None and (
+        not isinstance(task_config_path, str)
+        or not task_config_path
+        or not Path(task_config_path).is_file()
+        or not os.access(task_config_path, os.R_OK)
+    ):
+        raise ValueError("task_config_path must name an existing readable task recipe")
+
+    relay_backend_cfg = OmegaConf.select(config, "relay.backend")
+    if relay_backend_cfg is not None and str(relay_backend_cfg) not in {"ucx", "nccl"}:
+        raise ValueError(f"relay.backend must be 'ucx' or 'nccl', got {relay_backend_cfg!r}")
+    relay_num_cpus_cfg = OmegaConf.select(config, "relay.num_cpus")
+    if relay_num_cpus_cfg is not None and (
+        isinstance(relay_num_cpus_cfg, bool) or not isinstance(relay_num_cpus_cfg, int) or relay_num_cpus_cfg < 1
+    ):
+        raise ValueError("relay.num_cpus must be a positive integer")
+
     max_seq_len = int(config.data.max_prompt_length) + int(config.data.max_response_length)
     seq_split_size = (
         int(actor.megatron.context_parallel_size)
         if strategy == "megatron"
         else int(actor.get("ulysses_sequence_parallel_size", 1))
     )
-    if seq_split_size <= 0:
-        raise ValueError("sequence/context parallel size must be positive")
-    derived_token_cap = (max_seq_len + seq_split_size - 1) // seq_split_size
-    if actor.get("ppo_max_token_len_per_gpu") is None:
-        actor.ppo_max_token_len_per_gpu = derived_token_cap
-    if rollout.get("log_prob_max_token_len_per_gpu") is None:
-        rollout.log_prob_max_token_len_per_gpu = int(actor.ppo_max_token_len_per_gpu)
-
     if strategy == "megatron" and bool(actor.get("use_dynamic_bsz", False)):
-        actor_max_token_len = int(actor.ppo_max_token_len_per_gpu) * seq_split_size
-        if actor_max_token_len < max_seq_len:
-            raise ValueError(
-                "ppo_max_token_len_per_gpu * context_parallel_size must cover max_seq_len "
-                f"for Megatron dynamic batching: {actor_max_token_len} < {max_seq_len}"
-            )
-        infer_max_token_len = int(rollout.log_prob_max_token_len_per_gpu) * seq_split_size
-        if infer_max_token_len < max_seq_len:
-            raise ValueError(
-                "log_prob_max_token_len_per_gpu * context_parallel_size must cover max_seq_len "
-                f"for Megatron dynamic batching: {infer_max_token_len} < {max_seq_len}"
-            )
+        _check_megatron_token_cap(
+            actor.ppo_max_token_len_per_gpu, seq_split_size, max_seq_len, name="ppo_max_token_len_per_gpu"
+        )
+        _check_megatron_token_cap(
+            rollout.log_prob_max_token_len_per_gpu, seq_split_size, max_seq_len, name="log_prob_max_token_len_per_gpu"
+        )
 
     # Validate trainer and rollout pool geometry.
     trainer_nnodes = int(config.trainer.nnodes)

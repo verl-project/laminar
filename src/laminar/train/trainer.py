@@ -29,8 +29,7 @@ Responsibilities:
        publish new weights through the relay servers.
     6. Per-step metrics route through the centralized :class:`Tracker` actor.
 
-Critic and reference-policy branches are TODOs; the rest of the orchestration
-is self-contained on the driver event loop.
+Critic support remains a TODO; reference-policy KL uses verl's reference worker.
 """
 
 from __future__ import annotations
@@ -65,6 +64,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.profiler.performance import simple_timer
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from laminar.metrics import Aggregation, MetricSpec, export_flat_metrics, reduce_metric_snapshots
@@ -136,9 +136,113 @@ def _extract_actor_update_metrics(output: Any) -> dict[str, Any]:
     return actor_metrics
 
 
+_MEGATRON_PARALLEL_FIELDS = (
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "virtual_pipeline_model_parallel_size",
+    "context_parallel_size",
+    "dynamic_context_parallel",
+    "expert_model_parallel_size",
+    "expert_tensor_parallel_size",
+    "sequence_parallel",
+    "use_mbridge",
+)
+_REF_UNUSED_BATCH_KEYS = (
+    "routed_experts",
+    "old_log_probs",
+    "entropy",
+    "rollout_log_probs",
+    "behav_log_probs",
+    "rm_scores",
+    "advantages",
+    "returns",
+)
+
+
 def _rollout_correction_enabled(config: DictConfig) -> bool:
     rollout_corr_config = config.algorithm.rollout_correction
     return rollout_corr_config.rollout_is is not None or rollout_corr_config.rollout_rs is not None
+
+
+def _megatron_parallel_value(meg: Any, field_name: str) -> Any:
+    if field_name == "expert_tensor_parallel_size":
+        return meg.get("expert_tensor_parallel_size") or meg.get("tensor_model_parallel_size")
+    if field_name == "sequence_parallel":
+        return bool(meg.get("sequence_parallel", True)) and int(meg.get("tensor_model_parallel_size", 1)) > 1
+    return meg.get(field_name)
+
+
+def _check_megatron_token_cap(cap: Any, cp_size: int, max_seq_len: int, *, name: str) -> None:
+    total = -1 if cap is None else int(cap) * cp_size
+    if total < max_seq_len:
+        raise ValueError(
+            f"{name} * context_parallel_size must cover max_seq_len "
+            f"for Megatron dynamic batching: {total} < {max_seq_len}"
+        )
+
+
+def validate_actor_reference_config(config: DictConfig) -> None:
+    """Reject unsupported KL-in-reward/LoRA modes and mismatched colocated ref topology."""
+    if bool(config.algorithm.get("use_kl_in_reward", False)):
+        raise ValueError("async_rl does not support KL in reward; use actor.use_kl_loss")
+    model = config.actor_rollout_ref.get("model") or {}
+    lora_cfg = model.get("lora") or {}
+    if (
+        int(model.get("lora_rank", 0) or 0) > 0
+        or int(lora_cfg.get("rank", 0) or 0) > 0
+        or model.get("lora_adapter_path") is not None
+    ):
+        raise ValueError("async_rl does not support LoRA/PEFT configurations")
+
+    actor = config.actor_rollout_ref.actor
+    if not bool(actor.get("use_kl_loss", False)):
+        return
+    ref = config.actor_rollout_ref.get("ref")
+    if ref is None:
+        raise ValueError("actor.use_kl_loss=True requires actor_rollout_ref.ref")
+    actor_strategy = str(actor.get("strategy", "fsdp2"))
+    ref_strategy = str(ref.get("strategy", actor_strategy))
+    if ref_strategy != actor_strategy:
+        raise ValueError(f"colocated ref.strategy ({ref_strategy!r}) must match actor.strategy ({actor_strategy!r})")
+
+    ref_dynamic_bsz = bool(ref.get("log_prob_use_dynamic_bsz", False))
+    if not ref_dynamic_bsz:
+        mbs = ref.get("log_prob_micro_batch_size")
+        mbs_per_gpu = ref.get("log_prob_micro_batch_size_per_gpu")
+        if mbs is not None and mbs_per_gpu is not None:
+            raise ValueError(
+                "ref.log_prob_micro_batch_size and ref.log_prob_micro_batch_size_per_gpu are mutually exclusive"
+            )
+        if mbs is None and mbs_per_gpu is None:
+            raise ValueError("set ref.log_prob_micro_batch_size_per_gpu when ref.log_prob_use_dynamic_bsz=False")
+
+    if actor_strategy == "megatron":
+        actor_meg = actor.get("megatron")
+        ref_meg = ref.get("megatron")
+        if actor_meg is None or ref_meg is None:
+            raise ValueError("megatron reference policy requires actor.megatron and ref.megatron")
+        for field_name in _MEGATRON_PARALLEL_FIELDS:
+            if _megatron_parallel_value(ref_meg, field_name) != _megatron_parallel_value(actor_meg, field_name):
+                raise ValueError(
+                    f"colocated ref.megatron.{field_name} ({ref_meg.get(field_name)!r}) "
+                    f"must match actor.megatron.{field_name} ({actor_meg.get(field_name)!r})"
+                )
+        if ref_dynamic_bsz and (data_cfg := config.get("data")) is not None:
+            _check_megatron_token_cap(
+                ref.get("log_prob_max_token_len_per_gpu"),
+                int(ref_meg.context_parallel_size),
+                int(data_cfg.max_prompt_length) + int(data_cfg.max_response_length),
+                name="ref.log_prob_max_token_len_per_gpu",
+            )
+    else:
+        if int(ref.get("ulysses_sequence_parallel_size", 1)) != int(actor.get("ulysses_sequence_parallel_size", 1)):
+            raise ValueError("colocated ref.ulysses_sequence_parallel_size must match actor")
+        actor_fsdp_size = int((actor.get("fsdp_config") or {}).get("fsdp_size", -1))
+        ref_fsdp_size = int((ref.get("fsdp_config") or {}).get("fsdp_size", -1))
+        if ref_fsdp_size != actor_fsdp_size:
+            raise ValueError(
+                f"colocated ref.fsdp_config.fsdp_size ({ref_fsdp_size}) must match actor ({actor_fsdp_size})"
+            )
 
 
 def _extract_reward_group_metrics(batch: SampledBatch) -> dict[str, float]:
@@ -261,8 +365,7 @@ class AsyncRLTrainer:
         self.config = config
         if _rollout_correction_enabled(config) and not bool(config.actor_rollout_ref.rollout.calculate_log_probs):
             raise ValueError("decoupled rollout correction requires actor_rollout_ref.rollout.calculate_log_probs=True")
-        if bool(config.algorithm.use_kl_in_reward) or bool(config.actor_rollout_ref.actor.use_kl_loss):
-            raise ValueError("async_rl does not support ref-policy KL in reward or actor loss")
+        validate_actor_reference_config(config)
         self.trainer_config = trainer_config
         self.resource_pool_manager = resource_pool_manager
         self.experience_buffer = experience_buffer
@@ -308,14 +411,9 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    # TODO(async_rl): restore the `use_reference_policy` property when the
-    # ref-policy branch is wired back in. Drive it from
-    # ``algorithm.use_kl_in_reward`` OR ``actor_rollout_ref.actor.use_kl_loss``.
-    # When True it should: (1) switch ``AsyncActorWorker`` role to ``actor_ref``
-    # so the parent ``ActorRolloutRefWorker`` builds the ref TrainingWorker,
-    # (2) compute ``ref_log_prob`` before trainer-side advantage estimation,
-    # (3) feed ``ref_log_prob`` into the actor mini-batch + KL-in-loss branch
-    # of the actor PPO loss, (4) optionally apply KL-in-reward before advantage.
+    @property
+    def use_reference_policy(self) -> bool:
+        return bool(self.config.actor_rollout_ref.actor.get("use_kl_loss", False))
 
     @property
     def train_batch_size(self) -> int:
@@ -383,7 +481,7 @@ class AsyncRLTrainer:
             f"Initializing workers; resource pools: {list(self.resource_pool_manager.resource_pool_dict.keys())}"
         )
 
-        # Build cls→pool mapping. We only spawn actor today.
+        # Actor and reference workers share the existing trainer pool.
         # TODO(async_rl): add critic support.
         actor_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
         actor_worker_cls = _select_async_actor_worker_cls(actor_strategy)
@@ -393,6 +491,12 @@ class AsyncRLTrainer:
             role="actor",
         )
         actor_class_dict = {"actor": actor_cls}
+        if self.use_reference_policy:
+            actor_class_dict["ref"] = RayClassWithInitArgs(
+                cls=ray.remote(ActorRolloutRefWorker),
+                config=self.config.actor_rollout_ref,
+                role="ref",
+            )
 
         worker_dict_cls = create_colocated_worker_cls(class_dict=actor_class_dict)
         wg_kwargs = {}
@@ -408,13 +512,11 @@ class AsyncRLTrainer:
         )
         spawn_wg = self._wg_dict.spawn(prefix_set=actor_class_dict.keys())
         self.actor_wg = spawn_wg["actor"]
+        if self.use_reference_policy:
+            self.ref_wg = spawn_wg["ref"]
+            self.ref_wg.init_model()
         logger.info("%s group spawned for strategy=%s; calling init_model()", actor_worker_cls.__name__, actor_strategy)
         self.actor_wg.init_model()
-
-        # TODO(async_rl): when ref-policy support is added, spawn the actor with
-        # role="actor_ref" so the parent builds the ref TrainingWorker
-        # alongside the actor on the same pool.
-        # TODO(async_rl): add critic support.
 
     def _connect_relay(self) -> dict[str, TensorMeta]:
         """Connect actor ranks to Relay ingress and initialize actor-derived metadata."""
@@ -752,9 +854,7 @@ class AsyncRLTrainer:
             * ``response_mask`` (over the response window)
             * ``behav_log_probs`` / ``rollout_log_probs`` from rollout
 
-        TODO(async_rl): when ref-policy support is added, append ``ref_log_prob``
-        whenever the trainer has run ``_compute_ref_log_prob`` earlier in the
-        step (so the actor mini-batch carries it for KL-in-loss).
+        The read-only preparation phase later adds ``ref_log_prob`` for KL.
         """
         rollout_cfg = self.config.actor_rollout_ref.rollout
         require_routed_experts = bool(rollout_cfg.get("enable_rollout_routing_replay", False))
@@ -933,12 +1033,22 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    # TODO(async_rl): restore ``_compute_ref_log_prob`` here when the
-    # ref-policy branch is wired back in. It should run
-    # ``self.actor_wg.compute_ref_log_prob(td)`` (the parent
-    # ``ActorRolloutRefWorker`` already exposes this method when role
-    # contains ``ref``) and make ``ref_log_prob`` available before either
-    # trainer-side KL-in-reward or KL-in-loss consumes it.
+    def _compute_ref_log_prob(self, td: TensorDict, metrics: dict[str, Any]) -> None:
+        infer_td = td.clone(recurse=False)
+        for key in _REF_UNUSED_BATCH_KEYS:
+            infer_td.pop(key, None)
+        if not infer_td["input_ids"].is_nested:
+            infer_td = left_right_2_no_padding(infer_td)
+        tu.assign_non_tensor(infer_td, calculate_entropy=False, compute_loss=False)
+
+        ref_start = time.perf_counter()
+        output = self.ref_wg.compute_ref_log_prob(infer_td)
+        metrics["timing/ref_log_prob"] = time.perf_counter() - ref_start
+
+        log_probs = tu.get(output, "log_probs")
+        if log_probs is None:
+            raise RuntimeError("ref_wg.compute_ref_log_prob did not return log_probs")
+        td["ref_log_prob"] = no_padding_2_padding(log_probs, infer_td).float()
 
     # TODO(async_rl): add critic update support.
 
@@ -1012,7 +1122,11 @@ class AsyncRLTrainer:
 
     def _compute_actor_update_inputs(self, td: TensorDict, metrics: dict) -> None:
         """Compute read-only actor inputs without blocking the driver event loop."""
+        if not td["input_ids"].is_nested:
+            td = left_right_2_no_padding(td)
         self._compute_old_log_probs(td, metrics)
+        if self.use_reference_policy:
+            self._compute_ref_log_prob(td, metrics)
         self._apply_rollout_correction(td, metrics)
         restore_train_mode = bool(metrics.get("old_log_prob/recomputed", 0.0))
         metrics["old_log_prob/restore_train_mode"] = float(restore_train_mode)
@@ -1072,6 +1186,9 @@ class AsyncRLTrainer:
             actor_cfg.ppo_epochs,
         )
         actor_update_start = time.perf_counter()
+        # verl consumes nested batches even when the model forward keeps padding.
+        if not td["input_ids"].is_nested:
+            td = left_right_2_no_padding(td)
         output = self.actor_wg.update_actor(td)
         metrics["timing/actor_wg_update_actor"] = time.perf_counter() - actor_update_start
         metrics.update(_extract_actor_update_metrics(output))
@@ -1302,8 +1419,6 @@ class AsyncRLTrainer:
             await self._prepare_actor_update(td, metrics)
             prepare_actor_update_time_s = time.perf_counter() - prepare_actor_update_start
 
-            # TODO(async_rl): add ref-policy KL support. KL-in-reward needs
-            # the relevant ref log-probs before trainer-side advantage.
             # TODO(async_rl): add critic support.
 
             # 3. Synchronize with the previous publish immediately before the

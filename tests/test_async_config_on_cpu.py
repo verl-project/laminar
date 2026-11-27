@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import torch
+from hydra import compose, initialize_config_dir
 from hydra.errors import InstantiationException
 from omegaconf import OmegaConf
 from tensordict import NonTensorData, TensorDict
@@ -306,6 +307,216 @@ def test_async_trainer_selects_actor_worker_by_strategy():
 
     with pytest.raises(ValueError, match="not supported"):
         _select_async_actor_worker_cls("unknown")
+
+
+@pytest.mark.parametrize("use_kl_loss", [False, True])
+def test_init_actor_workers_colocates_native_reference_only_for_kl(monkeypatch, use_kl_loss):
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _composed_async_rl_config()
+    trainer.config.actor_rollout_ref.actor.use_kl_loss = use_kl_loss
+    pool = object()
+    trainer.resource_pool_manager = SimpleNamespace(resource_pool_dict={}, get_resource_pool=lambda _: pool)
+    initialized, classes = [], {}
+    groups = {role: SimpleNamespace(init_model=lambda role=role: initialized.append(role)) for role in ("actor", "ref")}
+
+    def worker_group(resource_pool, **kwargs):
+        assert resource_pool is pool
+        return SimpleNamespace(spawn=lambda prefix_set: {role: groups[role] for role in prefix_set})
+
+    monkeypatch.setattr(
+        async_rl_trainer_module,
+        "create_colocated_worker_cls",
+        lambda class_dict: classes.update(class_dict),
+    )
+    trainer.ray_worker_group_cls = worker_group
+
+    trainer._init_actor_workers()
+
+    assert classes["actor"].kwargs["role"] == "actor"
+    assert initialized == (["ref", "actor"] if use_kl_loss else ["actor"])
+    if use_kl_loss:
+        assert classes["ref"].cls.__ray_actor_class__ is ActorRolloutRefWorker
+        assert classes["ref"].kwargs["role"] == "ref"
+        assert trainer.ref_wg is groups["ref"]
+    else:
+        assert "ref" not in classes
+        assert not hasattr(trainer, "ref_wg")
+
+
+@pytest.mark.parametrize("use_kl_loss", [False, True])
+def test_reference_log_probs_reach_actor_update_only_for_kl(monkeypatch, use_kl_loss):
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _composed_async_rl_config()
+    trainer.config.actor_rollout_ref.actor.use_kl_loss = use_kl_loss
+    trainer.config.actor_rollout_ref.actor.ppo_mini_batch_size = 2
+    trainer.config.actor_rollout_ref.rollout.n = 1
+    trainer.config.data.train_batch_size = 2
+    trainer.global_steps = 1
+    calls, updates, unpad_calls = [], [], []
+    orig_unpad = async_rl_trainer_module.left_right_2_no_padding
+
+    def tracked_unpad(data):
+        unpad_calls.append(1)
+        return orig_unpad(data)
+
+    def compute_ref_log_prob(infer_td):
+        assert infer_td["input_ids"].is_nested
+        assert tu.get(infer_td, "calculate_entropy") is False
+        assert tu.get(infer_td, "compute_loss") is False
+        assert tu.get(infer_td, "temperature") == 1.0
+        for stripped in ("routed_experts", "old_log_probs", "advantages", "rm_scores"):
+            assert stripped not in infer_td.keys()
+        calls.append("ref")
+        return TensorDict({"log_probs": torch.arange(6, dtype=torch.float32)}, batch_size=[])
+
+    monkeypatch.setattr(async_rl_trainer_module, "left_right_2_no_padding", tracked_unpad)
+    trainer.ref_wg = SimpleNamespace(compute_ref_log_prob=compute_ref_log_prob)
+    trainer.actor_wg = SimpleNamespace(update_actor=lambda td: updates.append(td))
+    monkeypatch.setattr(
+        trainer, "_compute_old_log_probs", lambda td, _metrics: td.__setitem__("old_log_probs", torch.zeros(2, 3))
+    )
+    monkeypatch.setattr(trainer, "_apply_rollout_correction", lambda td, _metrics: None)
+    td = TensorDict(
+        {
+            "prompts": torch.tensor([[11, 12], [0, 13]]),
+            "responses": torch.tensor([[21, 22, 0], [23, 0, 0]]),
+            "input_ids": torch.tensor([[11, 12, 21, 22, 0], [0, 13, 23, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 0], [0, 1, 1, 0, 0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3, 0], [0, 0, 1, 0, 0]]),
+            "response_mask": torch.tensor([[1, 1, 0], [1, 0, 0]]),
+            "routed_experts": torch.ones((2, 5, 2), dtype=torch.int32),
+            "advantages": torch.ones((2, 3)),
+            "rm_scores": torch.zeros((2, 3)),
+            "temperature": NonTensorData(1.0),
+        },
+        batch_size=[2],
+    )
+    metrics: dict[str, Any] = {}
+
+    trainer._compute_actor_update_inputs(td, metrics)
+    trainer._update_actor(td, metrics)
+
+    assert len(unpad_calls) == 1
+    assert updates[0] is td
+    assert td["input_ids"].is_nested
+    assert calls == (["ref"] if use_kl_loss else [])
+    if use_kl_loss:
+        torch.testing.assert_close(td["ref_log_prob"], torch.tensor([[1.0, 2.0, 0.0], [4.0, 0.0, 0.0]]))
+        assert metrics["timing/ref_log_prob"] >= 0.0
+        trainer.ref_wg = SimpleNamespace(compute_ref_log_prob=lambda _td: TensorDict({}, batch_size=[]))
+        with pytest.raises(RuntimeError, match="did not return log_probs"):
+            trainer._compute_ref_log_prob(td, {})
+    else:
+        assert "ref_log_prob" not in td
+        assert "timing/ref_log_prob" not in metrics
+
+
+def _compose_resolved_async_rl(*overrides: str):
+    config_dir = str(_REPO_ROOT / "src/laminar/train/config")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        config = compose(config_name="async_rl", overrides=list(overrides))
+    return main_async_rl_module.resolve_train_config(config)
+
+
+def test_resolve_train_config_propagates_actor_defaults_to_reference():
+    fsdp_cfg = _compose_resolved_async_rl(
+        "actor_rollout_ref.actor.use_kl_loss=True",
+        "actor_rollout_ref.actor.use_dynamic_bsz=True",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=null",
+        "data.max_prompt_length=8192",
+        "data.max_response_length=32768",
+    )
+    assert fsdp_cfg.actor_rollout_ref.actor.ppo_max_token_len_per_gpu == 40960
+    assert fsdp_cfg.actor_rollout_ref.ref.log_prob_max_token_len_per_gpu == 40960
+    assert fsdp_cfg.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu == 40960
+
+    meg_cfg = _compose_resolved_async_rl(
+        "model_engine=megatron",
+        "actor_rollout_ref.actor.use_kl_loss=True",
+        "actor_rollout_ref.model.use_remove_padding=False",
+        "actor_rollout_ref.rollout.dtype=float16",
+        "actor_rollout_ref.actor.megatron.sequence_parallel=False",
+        "actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1",
+        "trainer.n_gpus_per_node=8",
+    )
+    ref_meg = meg_cfg.actor_rollout_ref.ref.megatron
+    assert ref_meg.dtype == "float16"
+    assert ref_meg.sequence_parallel is False
+    assert ref_meg.use_remove_padding is False
+    assert ref_meg.override_transformer_config.moe_router_dtype == "fp32"
+    assert ref_meg.override_transformer_config.moe_grouped_gemm is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        (["actor_rollout_ref.model.lora_rank=8"], "LoRA/PEFT"),
+        (["actor_rollout_ref.model.lora.rank=8"], "LoRA/PEFT"),
+        (["actor_rollout_ref.model.lora_adapter_path=/tmp/lora"], "LoRA/PEFT"),
+        (["actor_rollout_ref.actor.use_kl_loss=True", "actor_rollout_ref.ref.strategy=megatron"], "ref.strategy"),
+        (
+            [
+                "actor_rollout_ref.actor.use_kl_loss=True",
+                "actor_rollout_ref.ref.ulysses_sequence_parallel_size=2",
+            ],
+            "ulysses_sequence_parallel_size",
+        ),
+        (
+            ["actor_rollout_ref.actor.use_kl_loss=True", "actor_rollout_ref.ref.fsdp_config.fsdp_size=2"],
+            "fsdp_size",
+        ),
+        (
+            ["actor_rollout_ref.actor.use_kl_loss=True", "actor_rollout_ref.ref.log_prob_micro_batch_size=4"],
+            "mutually exclusive",
+        ),
+        (
+            [
+                "model_engine=megatron",
+                "actor_rollout_ref.actor.use_kl_loss=True",
+                "actor_rollout_ref.ref.megatron.context_parallel_size=2",
+                "trainer.n_gpus_per_node=8",
+            ],
+            "ref.megatron.context_parallel_size",
+        ),
+        (
+            [
+                "model_engine=megatron",
+                "actor_rollout_ref.actor.use_kl_loss=True",
+                "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2",
+                "actor_rollout_ref.ref.megatron.sequence_parallel=False",
+                "trainer.n_gpus_per_node=8",
+            ],
+            "ref.megatron.sequence_parallel",
+        ),
+        (
+            [
+                "model_engine=megatron",
+                "actor_rollout_ref.actor.use_kl_loss=True",
+                "actor_rollout_ref.actor.use_dynamic_bsz=True",
+                "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=512",
+                "data.max_prompt_length=2048",
+                "data.max_response_length=2048",
+                "trainer.n_gpus_per_node=8",
+            ],
+            "ref.log_prob_max_token_len_per_gpu",
+        ),
+    ],
+)
+def test_resolve_train_config_and_trainer_reject_invalid_lora_and_ref_topology(overrides, match):
+    config_dir = str(_REPO_ROOT / "src/laminar/train/config")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        raw_cfg = compose(config_name="async_rl", overrides=overrides)
+    with pytest.raises(ValueError, match=match):
+        main_async_rl_module.resolve_train_config(raw_cfg)
+    with pytest.raises(ValueError, match=match):
+        AsyncRLTrainer(
+            raw_cfg,
+            resource_pool_manager=None,
+            experience_buffer=None,
+            relay_client=None,
+            tracker=None,
+            trainer_config=AsyncRLTrainerConfig(),
+        )
 
 
 def test_async_actor_init_model_is_blocking_before_relay_connect():
@@ -1084,20 +1295,19 @@ def test_async_trainer_rejects_correction_without_rollout_log_probs():
         )
 
 
-def test_async_trainer_rejects_unsupported_ref_policy_kl():
-    for path in ("algorithm.use_kl_in_reward", "actor_rollout_ref.actor.use_kl_loss"):
-        config = _composed_async_rl_config()
-        OmegaConf.update(config, path, True)
+def test_async_trainer_rejects_kl_in_reward():
+    config = _composed_async_rl_config()
+    config.algorithm.use_kl_in_reward = True
 
-        with pytest.raises(ValueError, match="does not support ref-policy KL"):
-            AsyncRLTrainer(
-                config,
-                resource_pool_manager=None,
-                experience_buffer=None,
-                relay_client=None,
-                tracker=None,
-                trainer_config=AsyncRLTrainerConfig(),
-            )
+    with pytest.raises(ValueError, match="does not support KL in reward"):
+        AsyncRLTrainer(
+            config,
+            resource_pool_manager=None,
+            experience_buffer=None,
+            relay_client=None,
+            tracker=None,
+            trainer_config=AsyncRLTrainerConfig(),
+        )
 
 
 def test_train_batch_metrics_summarize_rewards_advantages():
@@ -1200,7 +1410,16 @@ def test_update_actor_records_four_by_32_trajectory_contract():
     )
     trainer.actor_wg = actor_wg
     trainer.global_steps = 1
-    td = TensorDict({"sample_id": torch.arange(128)}, batch_size=[128])
+    td = TensorDict(
+        {
+            "sample_id": torch.arange(128),
+            "input_ids": torch.ones(128, 1, dtype=torch.long),
+            "attention_mask": torch.ones(128, 1, dtype=torch.long),
+            "position_ids": torch.zeros(128, 1, dtype=torch.long),
+            "response_mask": torch.ones(128, 1, dtype=torch.long),
+        },
+        batch_size=[128],
+    )
     metrics = {}
 
     trainer._update_actor(td, metrics)
