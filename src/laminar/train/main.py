@@ -163,7 +163,7 @@ def _initialize_runtime(config: DictConfig) -> _AsyncRLRuntime:
         if config.trainer.total_epochs is not None:
             raise ValueError("async_rl classic rollout requires trainer.total_epochs=null; use total_training_steps")
         rollout_cfg: RolloutConfig = omega_conf_to_dataclass(config.actor_rollout_ref.rollout)
-        buffer_config: ExperienceBufferConfig = omega_conf_to_dataclass(config.experience_buffer)
+        buffer_config = ExperienceBufferConfig.from_config(config)
         agent_loop_manager_cls = _resolve_agent_loop_manager_class(config)
 
         tracker_cfg: TrackerConfig = TrackerConfig.from_config(config)

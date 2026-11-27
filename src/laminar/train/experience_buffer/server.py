@@ -57,6 +57,10 @@ _BUFFER_COUNTER_KEYS = (
     "lifecycle/released_trajectory_count",
     "eviction/after_commit_trajectory_count",
     "drop/trajectory_count",
+    "filter_groups/filtered_group_count",
+    "filter_groups/filtered_trajectory_count",
+    "filter_groups/zero_reward_group_count",
+    "filter_groups/one_reward_group_count",
     "sink/trajectory_clear_failure_count",
     "sink/prompt_terminal_clear_failure_count",
 )
@@ -88,6 +92,7 @@ class ExperienceBufferServer:
         self.sampler = config.sampler
         self.store_namespace = config.store_namespace
         self.poll_interval = config.poll_interval
+        self.filter_groups_enable = config.filter_groups_enable
 
         # Activated, unconsumed trajectories stay in arrival order for FIFO
         # capacity eviction regardless of sampling order. Staged and sampled
@@ -196,6 +201,31 @@ class ExperienceBufferServer:
                     continue
                 if self._prompt_terminals.get(uid) != terminal or self._prompt_group_keys.get(uid) != ready_keys:
                     self._activating_prompt_groups.discard(uid)
+                    continue
+                reward = group_context[0]["reward_score"]
+                # GRPO/RLOO retain a singleton's raw reward, so a nonzero
+                # singleton still has a task-learning signal.
+                zero_advantages = (len(group_context) > 1 or reward == 0.0) and all(
+                    member["reward_score"] == reward for member in group_context
+                )
+                if self.filter_groups_enable and zero_advantages:
+                    # Clear every segment and the terminal before forgetting
+                    # metadata; a concurrent poll must not re-admit this group.
+                    try:
+                        tq.kv_clear(keys=[*ready_keys, uid], partition_id=self.store_namespace)
+                    except Exception:
+                        self._metrics["sink/trajectory_clear_failure_count"] += 1
+                        for pending_uid, _keys, _records, _terminal in activation_plans:
+                            self._activating_prompt_groups.discard(pending_uid)
+                        raise
+                    self._metrics["filter_groups/filtered_group_count"] += 1
+                    self._metrics["filter_groups/filtered_trajectory_count"] += len(ready_keys)
+                    self._metrics["filter_groups/zero_reward_group_count"] += int(reward == 0.0)
+                    self._metrics["filter_groups/one_reward_group_count"] += int(reward == 1.0)
+                    self._metrics["drop/trajectory_count"] += len(ready_keys)
+                    self._activating_prompt_groups.discard(uid)
+                    self._drop_trajectory_state_locked(ready_keys)
+                    self._cleanup_prompt_terminals_locked([uid])
                     continue
                 self._prompt_group_context[uid] = group_context
                 self._activating_prompt_groups.discard(uid)

@@ -5,6 +5,8 @@ import pytest
 from omegaconf import OmegaConf
 from verl.utils.config import omega_conf_to_dataclass
 
+from laminar.train.experience_buffer.config import ExperienceBufferConfig
+
 
 def _buffer_cfg(**overrides):
     return OmegaConf.create({"_target_": "laminar.train.experience_buffer.config.ExperienceBufferConfig", **overrides})
@@ -32,6 +34,41 @@ def test_experience_buffer_config_defaults_to_fifo_sampler():
     buffer_config = omega_conf_to_dataclass(_buffer_cfg())
 
     assert buffer_config.sampler == "fifo"
+    assert buffer_config.filter_groups_enable is False
+
+
+@pytest.mark.parametrize("filter_groups", [None, {}, False, {"enable": False, "metric": "acc"}])
+def test_algorithm_group_filtering_is_disabled_without_an_enabled_switch(filter_groups):
+    config = OmegaConf.create({"experience_buffer": _buffer_cfg(), "algorithm": {"filter_groups": filter_groups}})
+
+    assert ExperienceBufferConfig.from_config(config).filter_groups_enable is False
+
+
+@pytest.mark.parametrize("filter_groups", [True, {"enable": True, "metric": "reward"}])
+def test_algorithm_reward_filtering_is_bound_to_the_buffer(filter_groups):
+    config = OmegaConf.create(
+        {
+            "experience_buffer": _buffer_cfg(max_size=512, sampler="version_lifo"),
+            "algorithm": {"filter_groups": filter_groups},
+        }
+    )
+    buffer_config = ExperienceBufferConfig.from_config(config)
+
+    assert buffer_config.filter_groups_enable is True
+    assert (buffer_config.max_size, buffer_config.sampler) == (512, "version_lifo")
+
+
+@pytest.mark.parametrize("metric", [None, "acc", "entropy"])
+def test_algorithm_group_filtering_rejects_unsupported_metrics(metric):
+    config = OmegaConf.create(
+        {
+            "experience_buffer": _buffer_cfg(),
+            "algorithm": {"filter_groups": {"enable": True, "metric": metric}},
+        }
+    )
+
+    with pytest.raises(ValueError, match="algorithm.filter_groups.metric=reward"):
+        ExperienceBufferConfig.from_config(config)
 
 
 @pytest.mark.parametrize(

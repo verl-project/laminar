@@ -99,6 +99,31 @@ uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
 
 - **Smoke test:** Run a 4-step check first with `bash recipes/swe/train.sh trainer.total_training_steps=4 trainer.save_freq=4` in a fresh `RAY_DATA_HOME` to verify optimizer steps, Relay weight publication, and checkpoint saving.
 
+## Qwen3.5-4B
+
+[`train_qwen35_4b.sh`](train_qwen35_4b.sh) uses 32 Megatron Actor/Ref GPUs
+(TP1 / PP1 / CP4 / EP1 / ETP1, DP8) and 48 TP1 vLLM GPUs on A100.
+Training uses GRPO/PPO, 32 prompts × 8 trajectories per step, 128K responses,
+token importance sampling capped at 2, reward-group filtering, and frozen Ref
+KL loss (`low_var_kl`, coefficient 0.001). It requires
+[PR #1: reference-policy KL loss](https://github.com/verl-project/laminar/pull/1).
+
+```bash
+export MODEL_PATH=/shared/models/Qwen3.5-4B
+uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
+  bash recipes/swe/train_qwen35_4b.sh
+```
+
+The launcher defaults to 160 steps and saves every 10 steps. The figure shows
+training reward, rollout-to-Actor k3 KL, and all 16 checkpoint validations.
+Training curves include a trailing 10-step mean.
+
+![Qwen3.5-4B training reward, rollout k3 KL and checkpoint validation](qwen35_4b.svg)
+
+SWE-bench Verified (`n=1`) improves from 236/497 scored instances (47.48%)
+to **282/500 (56.4%)**; three initial instances are unscored. Rates use the
+actual scored-session denominator. Rollout k3 KL is distinct from Ref KL loss.
+
 ## Evaluate checkpoints
 
 See [docs/evaluation.md](../../docs/evaluation.md) for the evaluation mechanism, configuration options, and Python Client / CLI details.

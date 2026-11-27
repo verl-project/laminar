@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from omegaconf import DictConfig
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,22 @@ class ExperienceBufferConfig:
     sampler: str = "fifo"
     store_namespace: str = "train"
     poll_interval: float = 1.0
+    filter_groups_enable: bool = False
+
+    @classmethod
+    def from_config(cls, config: DictConfig) -> ExperienceBufferConfig:
+        """Bind reward filtering to the algorithm switch."""
+        from verl.utils.config import omega_conf_to_dataclass
+
+        buffer_config: ExperienceBufferConfig = omega_conf_to_dataclass(config.experience_buffer)
+        filter_config = config.algorithm.get("filter_groups")
+        if isinstance(filter_config, bool):
+            enabled = filter_config
+        else:
+            enabled = filter_config is not None and bool(filter_config.get("enable", False))
+            if enabled and filter_config.get("metric") != "reward":
+                raise ValueError("async_rl group filtering requires algorithm.filter_groups.metric=reward")
+        return replace(buffer_config, filter_groups_enable=enabled)
 
     def __post_init__(self) -> None:
         if self.max_size is None or self.max_size <= 0:
