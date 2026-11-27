@@ -239,8 +239,9 @@ class RolloutDispatcher:
 
     async def _wait_for_available_version(self) -> tuple[int, int]:
         """Keep one pre-admission wait in this dispatcher, outside Router."""
-        started = asyncio.get_running_loop().time()
-        async with asyncio.timeout_at(started + _VERSION_WAIT_TIMEOUT_S) as budget:
+        loop = asyncio.get_running_loop()
+        readiness_started = loop.time()
+        async with asyncio.timeout_at(readiness_started + _VERSION_WAIT_TIMEOUT_S) as budget:
             trainer_version = await self._wait_for_trainer_version()
             planned_pause = False
             while True:
@@ -248,10 +249,19 @@ class RolloutDispatcher:
                     version = await self.rollout_router.get_routable_version.remote(weight_version=trainer_version)
                     return trainer_version, version
                 except RouteUnavailableError as error:
-                    if getattr(error, "planned_pause", False) and not planned_pause:
+                    is_pause = bool(getattr(error, "planned_pause", False))
+                    if is_pause and not planned_pause:
                         planned_pause = True
-                        budget.reschedule(started + _PLANNED_PAUSE_WAIT_TIMEOUT_S)
-                    await asyncio.sleep(_VERSION_POLL_INTERVAL_S)
+                        budget.reschedule(readiness_started + _PLANNED_PAUSE_WAIT_TIMEOUT_S)
+                    if getattr(error, "capacity_full", False):
+                        planned_pause = is_pause
+                        window = _PLANNED_PAUSE_WAIT_TIMEOUT_S if planned_pause else _VERSION_WAIT_TIMEOUT_S
+                        budget.reschedule(loop.time() + _VERSION_POLL_INTERVAL_S + window)
+                        await asyncio.sleep(_VERSION_POLL_INTERVAL_S)
+                        readiness_started = loop.time()
+                        budget.reschedule(readiness_started + window)
+                    else:
+                        await asyncio.sleep(_VERSION_POLL_INTERVAL_S)
 
     def _next_prompt_batch(self) -> TensorDict:
         try:

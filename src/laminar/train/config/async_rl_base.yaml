@@ -104,6 +104,11 @@ rollout_router:
     mode: "off"  # off | enforce
     max_snapshot_age_s: 5.0
     kv_cache_usage_threshold: 0.80
+  # Router-owned per-replica session cap shared across all agent runners
+  # (framework max_concurrent_sessions acts only as an optional outer guard
+  # when set). Null disables the cap.
+  replica_concurrency:
+    max_sessions: null
   # same_version | latest_version. A weight update aborts in-flight turns,
   # which keep their generated tokens and continue. same_version pins each
   # session to one weight version and uses Repack; latest_version keeps

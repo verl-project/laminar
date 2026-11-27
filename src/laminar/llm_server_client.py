@@ -149,25 +149,36 @@ class LLMServerClient:
     ):
         if type(planned_pause) is not bool:
             raise ValueError("planned_pause must be a boolean")
-        started = time.monotonic()
+        saw_pause = planned_pause
+        readiness_started = time.monotonic()
         hard_deadline = math.inf if caller_deadline is None else caller_deadline
-        normal_deadline = min(hard_deadline, started + self._wait.timeout_s)
-        pause_deadline = min(hard_deadline, started + self._wait.planned_pause_timeout_s)
-        deadline = pause_deadline if planned_pause else normal_deadline
         interval = self._wait.initial_backoff_s
         while True:
+            window = self._wait.planned_pause_timeout_s if saw_pause else self._wait.timeout_s
+            deadline = min(hard_deadline, readiness_started + window)
             if deadline <= time.monotonic():
                 raise TimeoutError("Router availability wait expired")
             try:
                 remote = getattr(self._router, method).remote(**kwargs)
                 return await self._settle_rpc(remote, deadline)
             except RouteUnavailableError as error:
-                if getattr(error, "planned_pause", False):
-                    deadline = pause_deadline
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Router availability wait expired") from error
-                await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
+                is_pause = bool(getattr(error, "planned_pause", False))
+                if is_pause:
+                    saw_pause = True
+                if getattr(error, "capacity_full", False):
+                    remaining_hard = hard_deadline - time.monotonic()
+                    if remaining_hard <= 0:
+                        raise TimeoutError("Router availability wait expired") from error
+                    await asyncio.sleep(min(remaining_hard, random.uniform(interval / 2, interval)))
+                    saw_pause = is_pause
+                    readiness_started = time.monotonic()
+                else:
+                    window = self._wait.planned_pause_timeout_s if saw_pause else self._wait.timeout_s
+                    deadline = min(hard_deadline, readiness_started + window)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Router availability wait expired") from error
+                    await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
                 interval = min(self._wait.max_backoff_s, interval * 2)
 
     async def _acquire_lease(

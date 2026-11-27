@@ -54,6 +54,8 @@ rollout_router:
     mode: "off"
     max_snapshot_age_s: 5.0
     kv_cache_usage_threshold: 0.80
+  replica_concurrency:
+    max_sessions: null
 
 timeout:
   init_model: 3600
